@@ -3,11 +3,7 @@ import asyncio
 import struct
 
 from lap_manager import LapManager
-from database import (
-    init_db,
-    get_device_by_mac,
-    is_race_active,
-)
+from database import init_db, get_device_by_mac
 
 TARGET_UUID = "ab907856-3412-3412-3412-341278563412"
 
@@ -47,16 +43,6 @@ def parse_ibeacon(advertisement_data):
 
 
 def detection_callback(device, advertisement_data):
-
-
-
-    print(device.address, advertisement_data.rssi, advertisement_data.manufacturer_data)
-    
-    
-    
-    if not is_race_active():
-        return
-
     beacon = parse_ibeacon(advertisement_data)
 
     if beacon is None:
@@ -88,8 +74,8 @@ async def main():
     init_db()
 
     print("BLE LAP TIMER START")
+    print("UUID filter enabled")
     print("Device identification: BLE MAC address")
-    print("Race active flag required")
     print("Press Ctrl+C to stop")
 
     scanner = BleakScanner(detection_callback)
