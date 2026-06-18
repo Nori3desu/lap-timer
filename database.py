@@ -63,6 +63,17 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS rssi_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mac_address TEXT NOT NULL,
+        name TEXT,
+        major INTEGER,
+        rssi INTEGER NOT NULL,
+        timestamp REAL NOT NULL
+    )
+    """)
+
     try:
         cur.execute("""
         ALTER TABLE laps
@@ -84,6 +95,11 @@ def init_db():
     cur.execute("""
     INSERT OR IGNORE INTO settings (key, value)
     VALUES ('current_race_id', '')
+    """)
+
+    cur.execute("""
+    INSERT OR IGNORE INTO settings (key, value)
+    VALUES ('product_mode', 'event')
     """)
 
     cur.execute("""
@@ -480,6 +496,75 @@ def get_setup_mode():
 
     return row["value"]
 
+def get_setting(key, default_value=None):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT value
+    FROM settings
+    WHERE key = ?
+    """, (key,))
+
+    row = cur.fetchone()
+    conn.close()
+
+    if row is None:
+        return default_value
+
+    return row["value"]
+
+
+def set_setting(key, value):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT OR REPLACE INTO settings (key, value)
+    VALUES (?, ?)
+    """, (key, str(value)))
+
+    conn.commit()
+    conn.close()
+
+def get_product_mode():
+    return get_setting("product_mode", "event")
+
+
+def set_product_mode(mode):
+    allowed_modes = [
+        "lite",
+        "rider",
+        "event",
+        "facility",
+        "pro",
+    ]
+
+    if mode not in allowed_modes:
+        raise ValueError("invalid product_mode")
+
+    set_setting("product_mode", mode)
+
+def get_rssi_settings():
+    return {
+        "enter_rssi_threshold": int(get_setting("enter_rssi_threshold", "-58")),
+        "exit_rssi_threshold": int(get_setting("exit_rssi_threshold", "-68")),
+        "cooldown_sec": float(get_setting("cooldown_sec", "3")),
+        "min_lap_time_sec": float(get_setting("min_lap_time_sec", "5")),
+    }
+
+
+def save_rssi_settings(
+    enter_rssi_threshold,
+    exit_rssi_threshold,
+    cooldown_sec,
+    min_lap_time_sec
+):
+    set_setting("enter_rssi_threshold", enter_rssi_threshold)
+    set_setting("exit_rssi_threshold", exit_rssi_threshold)
+    set_setting("cooldown_sec", cooldown_sec)
+    set_setting("min_lap_time_sec", min_lap_time_sec)
+
 def create_new_race():
     conn = get_connection()
     cur = conn.cursor()
@@ -567,6 +652,54 @@ def get_races():
     FROM races
     ORDER BY id DESC
     """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+def save_rssi_log(mac_address, name, major, rssi):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    now = time.time()
+
+    cur.execute("""
+    INSERT INTO rssi_logs (
+        mac_address,
+        name,
+        major,
+        rssi,
+        timestamp
+    )
+    VALUES (?, ?, ?, ?, ?)
+    """, (
+        mac_address,
+        name,
+        major,
+        rssi,
+        now
+    ))
+
+    conn.commit()
+    conn.close()
+
+def get_latest_rssi_logs(limit=100):
+    conn = sqlite3.connect("lap_timer.db")
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT
+        mac_address,
+        name,
+        major,
+        rssi,
+        timestamp AS created_at
+    FROM rssi_logs
+    ORDER BY timestamp DESC
+    LIMIT ?
+    """, (limit,))
 
     rows = cur.fetchall()
     conn.close()

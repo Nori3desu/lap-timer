@@ -5,6 +5,9 @@ import sqlite3
 import asyncio
 import html
 import time
+import subprocess
+import threading
+import os
 
 from ranking import (
     get_ranking,
@@ -28,6 +31,11 @@ from database import (
     finish_current_race,
     get_races,
     get_current_race_id,
+    get_rssi_settings,
+    save_rssi_settings,
+    get_latest_rssi_logs,
+    get_product_mode,
+set_product_mode,
     
 )
 
@@ -37,11 +45,20 @@ from backup import backup_db
 
 app = FastAPI()
 
-
 @app.on_event("startup")
 def startup():
     init_db()
 
+    product_mode = get_product_mode()
+
+    if product_mode == "lite":
+        current_race_id = get_current_race_id()
+
+        if current_race_id is None:
+            create_new_race()
+
+        set_setup_mode("race")
+        set_race_active(True)
 
 def format_time(sec):
     if sec is None:
@@ -61,9 +78,34 @@ def format_datetime(ts):
         time.localtime(ts)
     )
 
+
+def get_pi_temperature():
+    temp_path = "/sys/class/thermal/thermal_zone0/temp"
+
+    if not os.path.exists(temp_path):
+        return None
+
+    with open(temp_path, "r") as f:
+        temp_raw = f.read().strip()
+
+    return float(temp_raw) / 1000
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     setup_mode = get_setup_mode()
+
+    product_mode = get_product_mode()
+
+    product_mode_labels = {
+        "lite": "Lite",
+        "rider": "Rider",
+        "event": "Event",
+        "facility": "Facility",
+        "pro": "Pro",
+    }
+
+    product_mode_label = product_mode_labels.get(product_mode, product_mode)
+    is_lite = (product_mode == "lite")
 
     mode_labels = {
         "entry": "エントリー受付中",
@@ -73,9 +115,54 @@ def root():
     }
 
     mode_label = mode_labels.get(setup_mode, setup_mode)
+    pi_temp = get_pi_temperature()
+    pi_temp_text = "-" if pi_temp is None else f"{pi_temp:.1f} ℃"
+
+    if is_lite:
+        menu_html = """
+        <p>
+            <a href="/lite/result">
+                <button>リザルト</button>
+            </a>
+        </p>
+
+        <p>
+            <a href="/admin/rssi-monitor">
+                <button>RSSIモニタ</button>
+            </a>
+        </p>
+
+        <p>
+            <a href="/admin/rssi-settings">
+                <button>RSSI設定</button>
+            </a>
+        </p>
+        <form action="/admin/lite-reset" method="post">
+            <button type="submit">練習リセット</button>
+        </form>
+        """
+    else:
+        menu_html = """
+        <p>
+            <a href="/entry">
+                <button>レースエントリー</button>
+            </a>
+        </p>
+
+        <p>
+            <a href="/entries">
+                <button>エントリーリスト</button>
+            </a>
+        </p>
+
+        <p>
+            <a href="/live">
+                <button>リザルト</button>
+            </a>
+        </p>
+        """
 
     return f"""
-
     <html>
     <head>
         <meta charset="utf-8">
@@ -106,31 +193,77 @@ def root():
 
     <body>
         <h1>Lap Timer</h1>
-        <p>
-            現在の状態: <strong>{mode_label}</strong>
-        </p>
-      
-        <p>
-            <a href="/entry">
-                <button>レースエントリー</button>
-            </a>
-        </p>
 
-                <p>
-            <a href="/entries">
-                <button>エントリーリスト</button>
-            </a>
-        </p>
-
-                <p>
-            <a href="/live">
-                <button>リザルト</button>
-            </a>
+        
+        <p>
+            製品モード: <strong>{product_mode_label}</strong>
         </p>
         
+        <p>
+            Pi温度: <strong>{pi_temp_text}</strong>
+        </p>
+
+        {menu_html}
     </body>
     </html>
     """
+@app.get("/admin/shutdown", response_class=HTMLResponse)
+def shutdown_confirm():
+    return """
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>シャットダウン</title>
+    </head>
+    <body style="font-family:sans-serif;padding:20px;text-align:center;">
+        <h1>Piをシャットダウンします</h1>
+
+        <p>ACT LED停止後に電源をOFFしてください。</p>
+
+        <form action="/admin/shutdown/execute" method="post">
+            <button style="font-size:28px;padding:20px;width:100%;background:#cc3333;color:white;border:none;">
+                シャットダウン実行
+            </button>
+        </form>
+
+        <p><a href="/admin">戻る</a></p>
+    </body>
+    </html>
+    """
+
+@app.post("/admin/shutdown/execute", response_class=HTMLResponse)
+def shutdown_execute():
+
+    backup_db("before_shutdown")
+
+    def delayed_shutdown():
+        time.sleep(3)
+        subprocess.Popen([
+            "sudo",
+            "/usr/sbin/shutdown",
+            "-h",
+            "now"
+        ])
+
+    threading.Thread(
+        target=delayed_shutdown,
+        daemon=True
+    ).start()
+
+    return HTMLResponse("""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body style="font-family:sans-serif;padding:20px;text-align:center;">
+        <h1>シャットダウン中</h1>
+        <p>約3秒後に安全シャットダウンします。</p>
+        <p>ACT LED停止後、電源OFFしてください。</p>
+    </body>
+    </html>
+    """)
 
 
 @app.get("/ranking")
@@ -145,6 +278,35 @@ def reset_race():
     set_race_active(True)
 
     return RedirectResponse(url="/view", status_code=303)
+
+@app.post("/admin/lite-reset")
+def lite_reset():
+    product_mode = get_product_mode()
+
+    if product_mode != "lite":
+        return RedirectResponse(url="/admin", status_code=303)
+
+    backup_db("before_lite_reset")
+
+    set_race_active(False)
+    finish_current_race()
+
+    create_new_race()
+
+    set_setup_mode("race")
+    set_race_active(True)
+
+    backup_db("after_lite_reset")
+    
+    reset_request_path = os.path.join(
+        os.path.dirname(__file__),
+        "lite_reset.request",
+    )
+
+    with open(reset_request_path, "w", encoding="utf-8") as file:
+        file.write(str(time.time()))
+
+    return RedirectResponse(url="/", status_code=303)
 
 @app.post("/mode/entry")
 def mode_entry():
@@ -199,6 +361,7 @@ def ranking_table(title, rows, major=None, my_minor=None):
             <th>順位</th>
             <th>ゼッケン</th>
             <th>Name</th>
+            <th>車種</th>
             <th>チーム名</th>
             <th>周回数</th>
             <th>Best</th>
@@ -216,6 +379,7 @@ def ranking_table(title, rows, major=None, my_minor=None):
     for i, row in enumerate(rows, start=1):
         name = row["name"]
         team_name = row["team_name"] or ""
+        model_name = row["model_name"] or ""
         minor = row["minor"] if row["minor"] is not None else "-"
 
         link = f"/driver/{html.escape(name)}"
@@ -237,6 +401,7 @@ def ranking_table(title, rows, major=None, my_minor=None):
                     {html.escape(name)}
                 </a>
             </td>
+            <td>{html.escape(model_name)}</td>
             <td>{html.escape(team_name)}</td>
             <td>{row["laps"]}</td>
             <td>{format_time(row["best_lap"])}</td>
@@ -259,6 +424,7 @@ def get_overall_ranking_by_race(race_id):
     SELECT
         l.name,
         d.minor,
+        d.model_name,
         d.team_name,
         MAX(l.lap_number) AS laps,
         MAX(l.timestamp) AS last_pass_timestamp,
@@ -291,6 +457,7 @@ def get_major_rankings_by_race(race_id):
         SELECT
             l.name,
             d.minor,
+            d.model_name,
             d.team_name,
             l.major,
             MAX(l.lap_number) AS laps,
@@ -315,6 +482,73 @@ def get_major_rankings_by_race(race_id):
 
     conn.close()
     return result
+
+@app.get("/lite/result", response_class=HTMLResponse)
+def lite_result():
+    current_race_id = get_current_race_id()
+
+    if current_race_id is None:
+        rows = []
+    else:
+        rows = get_overall_ranking_by_race(current_race_id)
+
+    html_text = """
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="2">
+        <title>Lite リザルト</title>
+        <style>
+            body { font-family: sans-serif; padding: 16px; text-align: center; }
+            .card { background:#f5f5f5; padding:16px; margin:12px 0; border-radius:8px; }
+            .big { font-size: 32px; font-weight: bold; }
+            button { width:100%; font-size:22px; padding:16px; margin-top:16px; }
+        </style>
+    </head>
+    <body>
+        <a href="/">← 戻る</a>
+
+        <h1>Lite リザルト</h1>
+    """
+
+    if not rows:
+        html_text += """
+        <div class="card">
+            <p>まだラップがありません。</p>
+        </div>
+        """
+    else:
+        row = rows[0]
+
+        html_text += f"""
+        <div class="card">
+            <div>名前</div>
+            <div class="big">{html.escape(row["name"])}</div>
+        </div>
+
+        <div class="card">
+            <div>周回数</div>
+            <div class="big">{row["laps"]}</div>
+        </div>
+
+        <div class="card">
+            <div>ベストラップ</div>
+            <div class="big">{format_time(row["best_lap"])}</div>
+        </div>
+
+        <div class="card">
+            <div>平均ラップ</div>
+            <div class="big">{format_time(row["avg_lap"])}</div>
+        </div>
+        """
+
+    html_text += """
+    </body>
+    </html>
+    """
+
+    return html_text
 
 @app.get("/live", response_class=HTMLResponse)
 def view(my_minor: int | None = None):
@@ -426,6 +660,19 @@ def view(my_minor: int | None = None):
 def admin():
     setup_mode = get_setup_mode()
 
+    product_mode = get_product_mode()
+
+    product_mode_labels = {
+        "lite": "Lite / 個人練習",
+        "rider": "Rider / 中級競技",
+        "event": "Event / 草レース運営",
+        "facility": "Facility SaaS / 常設コース",
+        "pro": "Pro Telemetry / プロ競技",
+    }
+
+    product_mode_label = product_mode_labels.get(product_mode, product_mode)
+    is_lite = (product_mode == "lite")
+
     mode_labels = {
         "entry": "エントリー受付中",
         "locked": "エントリー締切",
@@ -466,10 +713,13 @@ def admin():
         <h1>管理者メニュー</h1>
 
         <p>
-            現在の状態:
-            <strong>{mode_label}</strong>
+            製品モード:
+            <strong>{product_mode_label}</strong>
         </p>
 
+                {""
+        if is_lite else
+        '''
         <form action="/mode/entry" method="post">
             <button type="submit">エントリー開始</button>
         </form>
@@ -489,11 +739,519 @@ def admin():
         <a href="/entries">エントリー一覧</a>
         <a href="/devices">送信機管理</a>
         <a href="/majors">クラス管理</a>
-        <a href="/live" target="_blank">リザルト</a>
         <a href="/races">過去レース一覧</a>
+        '''
+        }
+
+        {"<a href='/lite/result' target='_blank'>リザルト</a>" if is_lite else "<a href='/live' target='_blank'>リザルト</a>"}
+
+        <a href="/admin/rssi-monitor">RSSIモニタ</a>
+
+        <a href="/admin/rssi-settings">RSSI設定</a>
+
+        <a href="/admin/rssi-analyze">RSSI自動分析</a>
+
+        {""
+        if not is_lite else
+        '''
+        <form action="/admin/lite-reset" method="post">
+            <button type="submit">練習リセット</button>
+        </form>
+        '''
+        }
+
+        <a href="/admin/product-mode">製品モード設定</a>
+        <a href="/admin/network">ネットワーク設定</a>
+        <a href="/admin/shutdown">シャットダウン</a>
     </body>
     </html>
     """
+@app.post("/admin/product-mode/save")
+def product_mode_save(mode: str = Form(...)):
+    set_product_mode(mode)
+
+    return RedirectResponse(url="/admin/product-mode", status_code=303)
+
+@app.get("/admin/network", response_class=HTMLResponse)
+def network_page():
+
+    try:
+        current_ssid = subprocess.check_output(
+            "iwgetid -r",
+            shell=True
+        ).decode().strip()
+    except:
+        current_ssid = "(未接続)"
+
+    return f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>ネットワーク設定</title>
+
+        <style>
+            body {{
+                font-family: sans-serif;
+                padding: 16px;
+            }}
+
+            button {{
+                width: 100%;
+                font-size: 22px;
+                padding: 18px;
+                margin-top: 18px;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <a href="/admin">← 管理者メニューへ戻る</a>
+
+        <h1>ネットワーク設定</h1>
+
+        <p>
+            現在のSSID:
+            <strong>{current_ssid}</strong>
+        </p>
+
+        <form action="/admin/network/ap" method="post">
+            <button type="submit">
+                APモードへ切替
+            </button>
+        </form>
+
+        <form action="/admin/network/home" method="post">
+            <button type="submit">
+                HOMEモードへ切替
+            </button>
+        </form>
+
+        <p>
+            APモード:
+            SSID=LapTimer
+            PASS=laptimer123
+        </p>
+    </body>
+    </html>
+    """
+
+@app.post("/admin/network/ap")
+def network_ap():
+
+    subprocess.Popen(
+        ["sudo", "/home/earth/lap-timer/network_ap.sh"]
+    )
+
+    return HTMLResponse("""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+
+    <body>
+        <h1>APモードへ切替中</h1>
+
+        <p>
+            数秒後に:
+            <br>
+            WiFi "LapTimer"
+            <br>
+            へ接続してください。
+        </p>
+
+        <p>
+            URL:
+            <br>
+            http://192.168.4.1:8000
+        </p>
+    </body>
+    </html>
+    """)
+
+@app.post("/admin/network/home")
+def network_home():
+
+    subprocess.Popen(
+        ["sudo", "/home/earth/lap-timer/network_home.sh"]
+    )
+
+    return HTMLResponse("""
+    <html>
+    <body>
+        <h1>HOMEモードへ切替中</h1>
+
+        <p>
+            数秒後に自宅WiFiへ戻ります。
+        </p>
+    </body>
+    </html>
+    """)    
+
+@app.get("/admin/product-mode", response_class=HTMLResponse)
+def product_mode_page():
+    current_mode = get_product_mode()
+
+    mode_labels = {
+        "lite": "Lite / 個人練習",
+        "rider": "Rider / 中級競技",
+        "event": "Event / 草レース運営",
+        "facility": "Facility SaaS / 常設コース",
+        "pro": "Pro Telemetry / プロ競技",
+    }
+
+    options = ""
+
+    for mode, label in mode_labels.items():
+        selected = "selected" if mode == current_mode else ""
+
+        options += f"""
+        <option value="{mode}" {selected}>
+            {label}
+        </option>
+        """
+
+    return f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>製品モード設定</title>
+        <style>
+            body {{ font-family: sans-serif; padding: 16px; }}
+            select {{ width: 100%; font-size: 18px; padding: 8px; }}
+            button {{ margin-top: 18px; font-size: 18px; padding: 12px; width: 100%; }}
+        </style>
+    </head>
+    <body>
+        <a href="/admin">← 管理者メニューへ戻る</a>
+
+        <h1>製品モード設定</h1>
+
+        <p>現在のモード: <strong>{mode_labels.get(current_mode, current_mode)}</strong></p>
+
+        <form action="/admin/product-mode/save" method="post">
+            <select name="mode">
+                {options}
+            </select>
+
+            <button type="submit">保存</button>
+        </form>
+
+        <h2>説明</h2>
+        <p>Lite: 個人練習向け。将来的に電源ONで自動計測。</p>
+        <p>Rider: 中級競技向け。簡易リザルトと個人管理。</p>
+        <p>Event: 草レース運営向け。エントリー、クラス、CSV、履歴。</p>
+        <p>Facility SaaS: 常設コース向け。クラウド連携予定。</p>
+        <p>Pro Telemetry: プロ競技向け。GPS/IMU等予定。</p>
+    </body>
+    </html>
+    """
+
+
+@app.get("/admin/rssi-settings", response_class=HTMLResponse)
+def rssi_settings():
+    settings = get_rssi_settings()
+
+    return f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>RSSI設定</title>
+        <style>
+            body {{ font-family: sans-serif; padding: 16px; }}
+            label {{ display: block; margin-top: 14px; }}
+            input {{ width: 100%; font-size: 18px; padding: 8px; }}
+            button {{ margin-top: 18px; font-size: 18px; padding: 12px; width: 100%; }}
+        </style>
+    </head>
+    <body>
+        <a href="/admin">← 管理者メニューへ戻る</a>
+
+        <h1>RSSI設定</h1>
+
+        <form action="/admin/rssi-settings/save" method="post">
+            <label>ENTER_RSSI_THRESHOLD（近づいた判定）</label>
+            <input type="number" name="enter_rssi_threshold" value="{settings["enter_rssi_threshold"]}">
+
+            <label>EXIT_RSSI_THRESHOLD（離れた判定）</label>
+            <input type="number" name="exit_rssi_threshold" value="{settings["exit_rssi_threshold"]}">
+
+            <label>COOLDOWN_SEC（通過後の無視秒数）</label>
+            <input type="number" step="0.1" name="cooldown_sec" value="{settings["cooldown_sec"]}">
+
+            <label>MIN_LAP_TIME_SEC（最低ラップ秒数）</label>
+            <input type="number" step="0.1" name="min_lap_time_sec" value="{settings["min_lap_time_sec"]}">
+
+            <button type="submit">保存</button>
+        </form>
+
+        <h2>目安</h2>
+        <p>近接が -50 前後、離れが -70 前後なら、ENTER=-58 / EXIT=-68 から試してください。</p>
+    </body>
+    </html>
+    """
+
+@app.post("/admin/rssi-settings/save")
+def rssi_settings_save(
+    enter_rssi_threshold: int = Form(...),
+    exit_rssi_threshold: int = Form(...),
+    cooldown_sec: float = Form(...),
+    min_lap_time_sec: float = Form(...),
+):
+    save_rssi_settings(
+        enter_rssi_threshold,
+        exit_rssi_threshold,
+        cooldown_sec,
+        min_lap_time_sec
+    )
+
+    return RedirectResponse(url="/admin/rssi-settings", status_code=303)
+
+@app.get("/admin/rssi-analyze", response_class=HTMLResponse)
+def rssi_analyze():
+    result = analyze_rssi_logs()
+
+    html_text = """
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>RSSI自動分析</title>
+        <style>
+            body { font-family: sans-serif; padding: 16px; }
+            .card { background:#f5f5f5; padding:12px; margin:12px 0; }
+            .big { font-size: 22px; font-weight: bold; }
+            a { display:block; margin-top: 12px; }
+        </style>
+    </head>
+    <body>
+        <a href="/admin">← 管理者メニューへ戻る</a>
+        <a href="/admin/rssi-monitor">RSSIモニタへ</a>
+
+        <h1>RSSI自動分析</h1>
+    """
+
+    if result is None:
+        html_text += """
+        <div class="card">
+            <p>ログが不足しています。</p>
+            <p>送信機を近づけた状態と、離した状態でしばらくログを取ってください。</p>
+            <p>最低20件以上必要です。</p>
+        </div>
+        """
+    else:
+        html_text += f"""
+        <div class="card">
+            <p>分析ログ数: {result["count"]}</p>
+            <p>近接平均RSSI: <span class="big">{result["near_avg"]:.1f}</span></p>
+            <p>離れ平均RSSI: <span class="big">{result["far_avg"]:.1f}</span></p>
+            <p>RSSI差: <span class="big">{result["gap"]:.1f} dB</span></p>
+            <p>安定度: <span class="big">{result["stability"]}</span></p>
+        </div>
+
+        <div class="card">
+            <h2>推奨設定</h2>
+            <p>ENTER_RSSI_THRESHOLD: <span class="big">{result["enter"]}</span></p>
+            <p>EXIT_RSSI_THRESHOLD: <span class="big">{result["exit"]}</span></p>
+        </div>
+
+        <p>
+            ENTERは「近づいた判定」、EXITは「離れた判定」です。
+        </p>
+        """
+
+    html_text += """
+    </body>
+    </html>
+    """
+
+    return html_text
+
+def analyze_rssi_logs():
+    logs = get_latest_rssi_logs(300)
+
+    if len(logs) < 20:
+        return None
+
+    rssi_values = sorted([log["rssi"] for log in logs])
+
+    low_values = rssi_values[:20]
+    high_values = rssi_values[-20:]
+
+    near_avg = sum(high_values) / len(high_values)
+    far_avg = sum(low_values) / len(low_values)
+
+    gap = near_avg - far_avg
+
+    enter = int((near_avg + far_avg) / 2 + 5)
+    exit = int((near_avg + far_avg) / 2 - 5)
+
+    if gap >= 25:
+        stability = "かなり安定"
+    elif gap >= 15:
+        stability = "普通"
+    else:
+        stability = "不安定"
+
+    return {
+        "near_avg": near_avg,
+        "far_avg": far_avg,
+        "gap": gap,
+        "enter": enter,
+        "exit": exit,
+        "stability": stability,
+        "count": len(logs),
+    }
+
+@app.get("/admin/rssi-monitor", response_class=HTMLResponse)
+
+def rssi_monitor():
+    logs = get_latest_rssi_logs(100)
+    settings = get_rssi_settings()
+
+    stats = {}
+
+    for log in logs:
+        mac = log["mac_address"]
+
+        if mac not in stats:
+            stats[mac] = {
+                "name": log["name"],
+                "major": log["major"],
+                "latest": log["rssi"],
+                "min": log["rssi"],
+                "max": log["rssi"],
+                "sum": 0,
+                "count": 0,
+                "created_at": log.get("created_at", log.get("timestamp", 0)),
+            }
+
+        stats[mac]["min"] = min(stats[mac]["min"], log["rssi"])
+        stats[mac]["max"] = max(stats[mac]["max"], log["rssi"])
+        stats[mac]["count"] += 1
+        stats[mac]["sum"] += log["rssi"]
+
+        log_created_at = log.get("created_at", log.get("timestamp", 0))
+        
+        if log_created_at > stats[mac]["created_at"]:
+            stats[mac]["created_at"] = log_created_at
+            stats[mac]["latest"] = log["rssi"]
+
+    html_text = f"""
+    
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="5">
+        <title>RSSIモニタ</title>
+        <style>
+
+            body {{ font-family: sans-serif; padding: 16px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+            th, td {{ border-bottom: 1px solid #ccc; padding: 8px; text-align: left; }}
+            th {{ background: #eee; }}
+            .strong {{ font-weight: bold; }}
+        </style>
+    </head>
+    <body>
+        <a href="/admin">← 管理者メニューへ戻る</a>
+
+        <h1>RSSIモニタ</h1>
+
+        <p>5秒ごとに自動更新します。</p>
+
+                <div style="background:#f5f5f5; padding:12px; margin:12px 0;">
+            <strong>現在のRSSI設定</strong><br>
+            ENTER_RSSI_THRESHOLD（近づいた判定）:
+            {settings["enter_rssi_threshold"]}<br>
+            EXIT_RSSI_THRESHOLD（離れた判定）:
+            {settings["exit_rssi_threshold"]}<br>
+            COOLDOWN_SEC:
+            {settings["cooldown_sec"]}<br>
+            MIN_LAP_TIME_SEC:
+            {settings["min_lap_time_sec"]}
+        </div>
+
+        <p>
+            <a href="/admin/rssi-settings">RSSI設定を変更する</a>
+            <br>
+            <a href="/admin/rssi-analyze">RSSI自動分析を見る</a>
+
+        </p>
+
+
+        <table>
+            <tr>
+                <th>Name</th>
+                <th>MAC</th>
+                <th>最新RSSI</th>
+                <th>最終受信</th>
+                <th>状態</th>
+                <th>最大</th>
+                <th>最小</th>
+                <th>平均</th>
+                <th>判定目安</th>
+            </tr>
+    """
+
+    if not stats:
+        html_text += """
+            <tr>
+                <td colspan="9">RSSIログなし</td>
+            </tr>
+        """
+
+    for mac, s in stats.items():
+        avg = s["sum"] / s["count"]
+
+        latest = s["latest"]
+        
+        age_sec = int(time.time() - s["created_at"])
+
+        if age_sec <= 3:
+            status = "受信中"
+        elif age_sec <= 10:
+            status = "直近"
+        else:
+            status = "古い"
+
+        if latest >= -55:
+            judge = "近接"
+        elif latest <= -70:
+            judge = "離れ"
+        else:
+            judge = "中間"
+
+        html_text += f"""
+            <tr>
+                <td>{html.escape(s["name"] or "")}</td>
+                <td>{html.escape(mac)}</td>
+                <td class="strong">{latest}</td>
+                <td>{age_sec}秒前</td>
+                <td>{status}</td>
+                <td>{s["max"]}</td>
+                <td>{s["min"]}</td>
+                <td>{avg:.1f}</td>
+                <td>{judge}</td>
+            </tr>
+        """
+
+    html_text += """
+        </table>
+
+        <h2>使い方</h2>
+        <p>送信機を通過位置に置いて「最新RSSI」を確認します。</p>
+        <p>次に、離れた位置に置いて「最新RSSI」を確認します。</p>
+        <p>近接と離れの差が大きいほど安定します。</p>
+    </body>
+    </html>
+    """
+
+    return html_text
 
 @app.get("/races", response_class=HTMLResponse)
 def races():
@@ -654,7 +1412,7 @@ def entries():
             <tr>
                 <th>ゼッケン</th>
                 <th>Name</th>
-                <th>車名</th>
+                <th>車種</th>
                 <th>チーム名</th>
                 <th>編集</th>
             </tr>
@@ -822,7 +1580,7 @@ def entry_edit(mac_address: str):
             <label>Name</label>
             <input name="name" value="{html.escape(device["name"])}">
 
-            <label>車名</label>
+            <label>車種</label>
             <input name="model_name" value="{html.escape(device["model_name"] or "")}">
 
             <label>チーム名</label>
@@ -892,7 +1650,7 @@ def devices():
         <table>
             <tr>
                 <th>Name</th>
-                <th>車名</th>
+                <th>車種</th>
                 <th>チーム</th>
                 <th>MAC</th>
                 <th>編集</th>
@@ -971,7 +1729,7 @@ def edit_device(mac_address: str):
             <label>Name</label>
             <input name="name" value="{html.escape(device["name"])}">
 
-            <label>車名</label>
+            <label>車種</label>
             <input name="model_name" value="{html.escape(device["model_name"] or "")}">
 
             <label>チーム名</label>

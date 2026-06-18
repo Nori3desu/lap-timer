@@ -7,6 +7,7 @@ from database import (
     init_db,
     get_device_by_mac,
     is_race_active,
+    save_rssi_log,
 )
 
 TARGET_UUID = "ab907856-3412-3412-3412-341278563412"
@@ -47,24 +48,6 @@ def parse_ibeacon(advertisement_data):
 
 
 def detection_callback(device, advertisement_data):
-
-
-
-    print(device.address, advertisement_data.rssi, advertisement_data.manufacturer_data)
-    
-    
-    
-    if not is_race_active():
-        return
-
-    beacon = parse_ibeacon(advertisement_data)
-
-    if beacon is None:
-        return
-
-    if beacon["uuid"] != TARGET_UUID:
-        return
-
     mac_address = device.address
 
     device_info = get_device_by_mac(mac_address)
@@ -77,11 +60,19 @@ def detection_callback(device, advertisement_data):
     major = device_info["major"]
     rssi = advertisement_data.rssi
 
+    save_rssi_log(
+        mac_address,
+        name,
+        major,
+        rssi
+    )
+
     lap_manager.update(
         name,
         major,
         rssi
     )
+
 
 
 async def main():
