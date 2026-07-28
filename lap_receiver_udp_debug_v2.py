@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
 SGS Smart Gate System
-UDP Lap Receiver Version 1.0
+UDP Lap Receiver Version 2.0
 
 受信形式:
     RX-0001,TX-4DFE95,6B:EB:E2:4D:FE:95,-68
 
 役割:
-    1. ESP32-C3受信機からUDPを受信
-    2. CSVを検証
-    3. Pi5の受信時刻を採用
-    4. RSSIによるENTRY / EXIT判定
+    1. ESP32-C3受信機2台からUDPを受信
+    2. RXごとに最新RSSIを個別保持
+    3. 2台の受信結果を統合してENTRY / EXITを判定
+    4. RSSI差が大きい通過を並走側として除外
     5. ラップをSQLiteとWeb用DBへ保存
-
-現段階:
-    RX-0001のみを判定に使用します。
-    RX-0002の2台統合判定は次段階で追加します。
 """
 
 from __future__ import annotations
@@ -24,7 +20,7 @@ import asyncio
 import signal
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -36,44 +32,36 @@ from database import save_lap as save_web_lap
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
-# 詳細ログ用DB
 DATABASE_PATH = BASE_DIR / "lap_timer.sqlite3"
-
-# FastAPI / Web画面が使用しているDB
 WEB_DATABASE_PATH = BASE_DIR / "lap_timer.db"
-
-# Liteモードのリセット要求ファイル
 RESET_REQUEST_PATH = BASE_DIR / "lite_reset.request"
 
 UDP_BIND_ADDRESS = "0.0.0.0"
 UDP_PORT = 5000
 UDP_BUFFER_SIZE = 1024
 
-# 現段階ではRX-0001のみでラップ判定
-ACTIVE_RECEIVER_IDS = {"RX-0001"}
+ACTIVE_RECEIVER_IDS = {"RX-0001", "RX-0002"}
 
 
 # ============================================================
-# ラップ判定設定
+# 2台統合ラップ判定設定
 # ============================================================
 
-ENTRY_RSSI_THRESHOLD = -55
-EXIT_RSSI_THRESHOLD = -65
+ENTRY_RSSI_THRESHOLD = -60
+EXIT_RSSI_THRESHOLD = -68
 MINIMUM_LAP_SECONDS = 10.0
 
-ENTRY_CONFIRM_SECONDS = 0.8
-EXIT_CONFIRM_SECONDS = 1.5
+MAX_RECEIVER_RSSI_DIFFERENCE = 12
+RECEIVER_DATA_TIMEOUT_SECONDS = 0.60
 
-# ENTRY判定デバッグ表示
+ENTRY_CONFIRM_SECONDS = 0.25
+EXIT_CONFIRM_SECONDS = 1.0
+
 DEBUG_ENTRY = True
 
 DISPLAY_INTERVAL_SECONDS = 0.25
 RSSI_LOG_INTERVAL_SECONDS = 1.0
 STATUS_INTERVAL_SECONDS = 10.0
-
-# UDPが途切れた場合、ENTRY/EXIT候補を破棄する時間
-PACKET_TIMEOUT_SECONDS = 2.0
 
 
 # ============================================================
@@ -120,31 +108,6 @@ TRANSMITTER_BY_MAC = {
 # 動作状態
 # ============================================================
 
-@dataclass
-class TransmitterState:
-    inside_detection_zone: bool = False
-    last_lap_monotonic: float | None = None
-    last_lap_datetime: datetime | None = None
-    lap_count: int = 0
-
-    last_display_monotonic: float = 0.0
-    last_rssi_log_monotonic: float = 0.0
-    last_packet_monotonic: float = 0.0
-
-    last_rssi: int | None = None
-    last_receiver_id: str | None = None
-
-    waiting_for_clear_after_reset: bool = False
-    entry_candidate_since: float | None = None
-    exit_candidate_since: float | None = None
-
-
-transmitter_states: dict[str, TransmitterState] = {
-    transmitter.serial_number: TransmitterState()
-    for transmitter in REGISTERED_TRANSMITTERS
-}
-
-
 @dataclass(frozen=True)
 class UdpPacket:
     receiver_id: str
@@ -156,6 +119,45 @@ class UdpPacket:
     sender_port: int
 
 
+@dataclass
+class ReceiverState:
+    rssi: int | None = None
+    last_packet_monotonic: float = 0.0
+    last_packet: UdpPacket | None = None
+
+
+@dataclass
+class TransmitterState:
+    inside_detection_zone: bool = False
+    last_lap_monotonic: float | None = None
+    last_lap_datetime: datetime | None = None
+    lap_count: int = 0
+
+    receiver_states: dict[str, ReceiverState] = field(
+        default_factory=lambda: {
+            receiver_id: ReceiverState()
+            for receiver_id in ACTIVE_RECEIVER_IDS
+        }
+    )
+
+    last_display_monotonic: float = 0.0
+    last_rssi_log_monotonic: float = 0.0
+
+    waiting_for_clear_after_reset: bool = False
+    entry_candidate_since: float | None = None
+    exit_candidate_since: float | None = None
+
+    last_gate_valid: bool = False
+    last_combined_rssi: int | None = None
+    last_rssi_difference: int | None = None
+
+
+transmitter_states: dict[str, TransmitterState] = {
+    transmitter.serial_number: TransmitterState()
+    for transmitter in REGISTERED_TRANSMITTERS
+}
+
+
 running = True
 
 udp_packet_count = 0
@@ -163,6 +165,7 @@ valid_packet_count = 0
 invalid_packet_count = 0
 unknown_transmitter_count = 0
 inactive_receiver_count = 0
+parallel_reject_count = 0
 last_status_monotonic = 0.0
 
 
@@ -171,11 +174,7 @@ last_status_monotonic = 0.0
 # ============================================================
 
 def open_database() -> sqlite3.Connection:
-    connection = sqlite3.connect(
-        DATABASE_PATH,
-        timeout=5.0,
-    )
-
+    connection = sqlite3.connect(DATABASE_PATH, timeout=5.0)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
 
@@ -216,16 +215,14 @@ def open_database() -> sqlite3.Connection:
 
     connection.execute(
         """
-        CREATE INDEX IF NOT EXISTS
-        idx_laps_serial_number
+        CREATE INDEX IF NOT EXISTS idx_laps_serial_number
         ON laps(serial_number, lap_number)
         """
     )
 
     connection.execute(
         """
-        CREATE INDEX IF NOT EXISTS
-        idx_laps_passed_at
+        CREATE INDEX IF NOT EXISTS idx_laps_passed_at
         ON laps(passed_at)
         """
     )
@@ -234,9 +231,7 @@ def open_database() -> sqlite3.Connection:
     return connection
 
 
-def register_transmitters(
-    connection: sqlite3.Connection,
-) -> None:
+def register_transmitters(connection: sqlite3.Connection) -> None:
     now = datetime.now().isoformat(timespec="seconds")
 
     for transmitter in REGISTERED_TRANSMITTERS:
@@ -273,15 +268,11 @@ def register_transmitters(
     connection.commit()
 
 
-def load_existing_lap_counts(
-    connection: sqlite3.Connection,
-) -> None:
+def load_existing_lap_counts(connection: sqlite3.Connection) -> None:
     for transmitter in REGISTERED_TRANSMITTERS:
         row = connection.execute(
             """
-            SELECT
-                lap_number,
-                passed_at
+            SELECT lap_number, passed_at
             FROM laps
             WHERE serial_number = ?
             ORDER BY lap_number DESC
@@ -309,6 +300,7 @@ def save_detail_lap(
     state: TransmitterState,
     packet: UdpPacket,
     lap_time_seconds: float | None,
+    combined_rssi: int,
 ) -> None:
     connection.execute(
         """
@@ -331,15 +323,14 @@ def save_detail_lap(
             state.lap_count,
             packet.received_at.isoformat(timespec="milliseconds"),
             lap_time_seconds,
-            packet.rssi,
+            combined_rssi,
             transmitter.uuid.lower(),
             transmitter.major,
             transmitter.minor,
             packet.mac_address,
-            packet.receiver_id,
+            "RX-0001+RX-0002",
         ),
     )
-
     connection.commit()
 
 
@@ -354,11 +345,7 @@ def save_web_rssi_log(
     connection: sqlite3.Connection | None = None
 
     try:
-        connection = sqlite3.connect(
-            WEB_DATABASE_PATH,
-            timeout=5.0,
-        )
-
+        connection = sqlite3.connect(WEB_DATABASE_PATH, timeout=5.0)
         connection.execute(
             """
             INSERT INTO rssi_logs (
@@ -378,7 +365,6 @@ def save_web_rssi_log(
                 packet.received_at.timestamp(),
             ),
         )
-
         connection.commit()
 
     except sqlite3.Error as error:
@@ -426,11 +412,7 @@ def parse_udp_packet(
         return None
 
     mac_parts = mac_address.split(":")
-
-    if (
-        len(mac_parts) != 6
-        or any(len(part) != 2 for part in mac_parts)
-    ):
+    if len(mac_parts) != 6 or any(len(part) != 2 for part in mac_parts):
         return None
 
     try:
@@ -457,21 +439,15 @@ def parse_udp_packet(
 def find_registered_transmitter(
     packet: UdpPacket,
 ) -> RegisteredTransmitter | None:
-    by_udp_id = TRANSMITTER_BY_UDP_ID.get(
-        packet.udp_transmitter_id
-    )
-
-    by_mac = TRANSMITTER_BY_MAC.get(
-        packet.mac_address
-    )
+    by_udp_id = TRANSMITTER_BY_UDP_ID.get(packet.udp_transmitter_id)
+    by_mac = TRANSMITTER_BY_MAC.get(packet.mac_address)
 
     if by_udp_id is not None and by_mac is not None:
         if by_udp_id.serial_number != by_mac.serial_number:
             print()
             print(
                 "[UDP拒否] TX-IDとMACの登録先が一致しません: "
-                f"{packet.udp_transmitter_id} / "
-                f"{packet.mac_address}"
+                f"{packet.udp_transmitter_id} / {packet.mac_address}"
             )
             return None
 
@@ -479,14 +455,56 @@ def find_registered_transmitter(
 
 
 # ============================================================
-# ラップ判定
+# 2台統合判定
 # ============================================================
+
+def get_fresh_receiver_data(
+    state: TransmitterState,
+    now_monotonic: float,
+) -> dict[str, ReceiverState]:
+    fresh: dict[str, ReceiverState] = {}
+
+    for receiver_id in ACTIVE_RECEIVER_IDS:
+        receiver_state = state.receiver_states[receiver_id]
+
+        if receiver_state.rssi is None:
+            continue
+
+        age = now_monotonic - receiver_state.last_packet_monotonic
+
+        if age <= RECEIVER_DATA_TIMEOUT_SECONDS:
+            fresh[receiver_id] = receiver_state
+
+    return fresh
+
+
+def select_reference_packet(
+    fresh: dict[str, ReceiverState],
+) -> UdpPacket | None:
+    valid_states = [
+        receiver_state
+        for receiver_state in fresh.values()
+        if receiver_state.rssi is not None
+        and receiver_state.last_packet is not None
+    ]
+
+    if not valid_states:
+        return None
+
+    weakest_state = min(
+        valid_states,
+        key=lambda receiver_state: receiver_state.rssi,
+    )
+    return weakest_state.last_packet
+
 
 def record_lap(
     connection: sqlite3.Connection,
     transmitter: RegisteredTransmitter,
     state: TransmitterState,
     packet: UdpPacket,
+    combined_rssi: int,
+    rssi_difference: int,
 ) -> None:
     now_monotonic = time.monotonic()
 
@@ -495,7 +513,6 @@ def record_lap(
 
         if elapsed < MINIMUM_LAP_SECONDS:
             remaining = MINIMUM_LAP_SECONDS - elapsed
-
             print()
             print(
                 f"[判定保留] {transmitter.serial_number} "
@@ -504,11 +521,8 @@ def record_lap(
             return
 
     lap_time_seconds: float | None = None
-
     if state.last_lap_monotonic is not None:
-        lap_time_seconds = (
-            now_monotonic - state.last_lap_monotonic
-        )
+        lap_time_seconds = now_monotonic - state.last_lap_monotonic
 
     state.lap_count += 1
     state.last_lap_monotonic = now_monotonic
@@ -520,6 +534,7 @@ def record_lap(
         state=state,
         packet=packet,
         lap_time_seconds=lap_time_seconds,
+        combined_rssi=combined_rssi,
     )
 
     try:
@@ -536,13 +551,15 @@ def record_lap(
             f"{transmitter.serial_number}: {error}"
         )
 
+    rx1_rssi = state.receiver_states["RX-0001"].rssi
+    rx2_rssi = state.receiver_states["RX-0002"].rssi
+
     print()
     print()
     print("============================================")
-    print("          UDP ラップ検出")
+    print("       UDP 2台統合ラップ検出")
     print("============================================")
-    print(f"受信機     : {packet.receiver_id}")
-    print(f"送信元IP   : {packet.sender_ip}:{packet.sender_port}")
+    print("受信機     : RX-0001 + RX-0002")
     print(f"送信機     : {transmitter.serial_number}")
     print(f"UDP TX-ID  : {packet.udp_transmitter_id}")
     print(f"MAC        : {packet.mac_address}")
@@ -559,37 +576,25 @@ def record_lap(
     else:
         print(f"ラップタイム: {lap_time_seconds:.3f} 秒")
 
-    print(f"RSSI       : {packet.rssi} dBm")
+    print(f"RX-0001    : {rx1_rssi} dBm")
+    print(f"RX-0002    : {rx2_rssi} dBm")
+    print(f"統合RSSI   : {combined_rssi} dBm")
+    print(f"RSSI差     : {rssi_difference} dB")
     print("============================================")
     print()
 
 
-def process_packet(
-    connection: sqlite3.Connection,
+def update_receiver_state(
     transmitter: RegisteredTransmitter,
     packet: UdpPacket,
 ) -> None:
     state = transmitter_states[transmitter.serial_number]
     now_monotonic = time.monotonic()
 
-    state.last_packet_monotonic = now_monotonic
-    state.last_rssi = packet.rssi
-    state.last_receiver_id = packet.receiver_id
-
-    if state.waiting_for_clear_after_reset:
-        if packet.rssi < EXIT_RSSI_THRESHOLD:
-            state.waiting_for_clear_after_reset = False
-            state.inside_detection_zone = False
-
-            print()
-            print(
-                "[リセット後のゾーン離脱確認] "
-                f"{transmitter.serial_number} "
-                f"RSSI={packet.rssi} dBm"
-            )
-            print("次の通過から計測を開始します。")
-
-        return
+    receiver_state = state.receiver_states[packet.receiver_id]
+    receiver_state.rssi = packet.rssi
+    receiver_state.last_packet_monotonic = now_monotonic
+    receiver_state.last_packet = packet
 
     if (
         now_monotonic - state.last_rssi_log_monotonic
@@ -601,21 +606,80 @@ def process_packet(
         )
         state.last_rssi_log_monotonic = now_monotonic
 
+
+def evaluate_gate(
+    connection: sqlite3.Connection,
+    transmitter: RegisteredTransmitter,
+) -> None:
+    global parallel_reject_count
+
+    state = transmitter_states[transmitter.serial_number]
+    now_monotonic = time.monotonic()
+
+    fresh = get_fresh_receiver_data(state, now_monotonic)
+    both_receivers_fresh = len(fresh) == len(ACTIVE_RECEIVER_IDS)
+
+    rx1 = fresh.get("RX-0001")
+    rx2 = fresh.get("RX-0002")
+
+    combined_rssi: int | None = None
+    rssi_difference: int | None = None
+    gate_valid = False
+    entry_signal = False
+
+    if (
+        both_receivers_fresh
+        and rx1 is not None
+        and rx2 is not None
+        and rx1.rssi is not None
+        and rx2.rssi is not None
+    ):
+        combined_rssi = min(rx1.rssi, rx2.rssi)
+        rssi_difference = abs(rx1.rssi - rx2.rssi)
+
+        gate_valid = (
+            rssi_difference <= MAX_RECEIVER_RSSI_DIFFERENCE
+        )
+
+        entry_signal = (
+            gate_valid
+            and rx1.rssi >= ENTRY_RSSI_THRESHOLD
+            and rx2.rssi >= ENTRY_RSSI_THRESHOLD
+        )
+
+    state.last_gate_valid = gate_valid
+    state.last_combined_rssi = combined_rssi
+    state.last_rssi_difference = rssi_difference
+
     if (
         now_monotonic - state.last_display_monotonic
         >= DISPLAY_INTERVAL_SECONDS
     ):
+        rx1_value = state.receiver_states["RX-0001"].rssi
+        rx2_value = state.receiver_states["RX-0002"].rssi
+        rx1_text = str(rx1_value) if rx1_value is not None else "-"
+        rx2_text = str(rx2_value) if rx2_value is not None else "-"
+
         zone_text = (
             "通過済み"
             if state.inside_detection_zone
             else "待機中"
         )
 
+        if entry_signal:
+            judge_text = "成立候補"
+        elif both_receivers_fresh and not gate_valid:
+            judge_text = "並走除外"
+        else:
+            judge_text = "待機"
+
         print(
             "\r"
-            f"{packet.receiver_id}  "
             f"{transmitter.serial_number}  "
-            f"RSSI={packet.rssi:4d} dBm  "
+            f"RX1={rx1_text:>4}  "
+            f"RX2={rx2_text:>4}  "
+            f"差={str(rssi_difference):>3}  "
+            f"判定={judge_text:8s}  "
             f"状態={zone_text:8s}  "
             f"ラップ={state.lap_count:3d}",
             end="",
@@ -624,20 +688,58 @@ def process_packet(
 
         state.last_display_monotonic = now_monotonic
 
+    if state.waiting_for_clear_after_reset:
+        both_below_exit = (
+            both_receivers_fresh
+            and rx1 is not None
+            and rx2 is not None
+            and rx1.rssi is not None
+            and rx2.rssi is not None
+            and rx1.rssi < EXIT_RSSI_THRESHOLD
+            and rx2.rssi < EXIT_RSSI_THRESHOLD
+        )
+
+        no_fresh_data = len(fresh) == 0
+        clear_signal = both_below_exit or no_fresh_data
+
+        if clear_signal:
+            if state.exit_candidate_since is None:
+                state.exit_candidate_since = now_monotonic
+
+            if (
+                now_monotonic - state.exit_candidate_since
+                >= EXIT_CONFIRM_SECONDS
+            ):
+                state.waiting_for_clear_after_reset = False
+                state.inside_detection_zone = False
+                state.exit_candidate_since = None
+
+                print()
+                print(
+                    "[リセット後のゾーン離脱確認] "
+                    f"{transmitter.serial_number}"
+                )
+                print("次の通過から計測を開始します。")
+        else:
+            state.exit_candidate_since = None
+
+        return
+
     if not state.inside_detection_zone:
         state.exit_candidate_since = None
 
-        if packet.rssi >= ENTRY_RSSI_THRESHOLD:
+        if entry_signal:
             if state.entry_candidate_since is None:
                 state.entry_candidate_since = now_monotonic
 
                 if DEBUG_ENTRY:
                     print()
                     print(
-                        f"[ENTRY開始] "
-                        f"{packet.receiver_id} "
+                        f"[統合ENTRY開始] "
                         f"{transmitter.serial_number} "
-                        f"RSSI={packet.rssi} dBm"
+                        f"RX1={rx1.rssi} "
+                        f"RX2={rx2.rssi} "
+                        f"差={rssi_difference} dB"
                     )
 
             entry_elapsed = (
@@ -646,24 +748,31 @@ def process_packet(
 
             if DEBUG_ENTRY:
                 print(
-                    f"\r[ENTRY継続] "
-                    f"{packet.receiver_id} "
+                    f"\r[統合ENTRY継続] "
                     f"{transmitter.serial_number} "
                     f"経過={entry_elapsed:.2f}秒 "
-                    f"RSSI={packet.rssi} dBm",
+                    f"RX1={rx1.rssi} "
+                    f"RX2={rx2.rssi} "
+                    f"差={rssi_difference} dB",
                     end="",
                     flush=True,
                 )
 
             if entry_elapsed >= ENTRY_CONFIRM_SECONDS:
+                reference_packet = select_reference_packet(fresh)
+
+                if reference_packet is None:
+                    state.entry_candidate_since = None
+                    return
+
                 if DEBUG_ENTRY:
                     print()
                     print(
-                        f"[ENTRY成立] "
-                        f"{packet.receiver_id} "
+                        f"[統合ENTRY成立] "
                         f"{transmitter.serial_number} "
                         f"経過={entry_elapsed:.2f}秒 "
-                        f"RSSI={packet.rssi} dBm"
+                        f"統合RSSI={combined_rssi} dBm "
+                        f"差={rssi_difference} dB"
                     )
 
                 state.inside_detection_zone = True
@@ -673,26 +782,28 @@ def process_packet(
                     connection=connection,
                     transmitter=transmitter,
                     state=state,
-                    packet=packet,
+                    packet=reference_packet,
+                    combined_rssi=combined_rssi,
+                    rssi_difference=rssi_difference,
                 )
         else:
-            if (
-                DEBUG_ENTRY
-                and state.entry_candidate_since is not None
-            ):
+            if DEBUG_ENTRY and state.entry_candidate_since is not None:
                 entry_elapsed = (
                     now_monotonic - state.entry_candidate_since
                 )
-
                 print()
                 print(
-                    f"[ENTRYキャンセル] "
-                    f"{packet.receiver_id} "
+                    f"[統合ENTRYキャンセル] "
                     f"{transmitter.serial_number} "
-                    f"経過={entry_elapsed:.2f}秒 "
-                    f"RSSI={packet.rssi} dBm "
-                    f"(しきい値={ENTRY_RSSI_THRESHOLD} dBm)"
+                    f"経過={entry_elapsed:.2f}秒"
                 )
+
+            if (
+                both_receivers_fresh
+                and rssi_difference is not None
+                and rssi_difference > MAX_RECEIVER_RSSI_DIFFERENCE
+            ):
+                parallel_reject_count += 1
 
             state.entry_candidate_since = None
 
@@ -700,13 +811,24 @@ def process_packet(
 
     state.entry_candidate_since = None
 
-    if packet.rssi < EXIT_RSSI_THRESHOLD:
+    both_below_exit = (
+        both_receivers_fresh
+        and rx1 is not None
+        and rx2 is not None
+        and rx1.rssi is not None
+        and rx2.rssi is not None
+        and rx1.rssi < EXIT_RSSI_THRESHOLD
+        and rx2.rssi < EXIT_RSSI_THRESHOLD
+    )
+
+    no_fresh_data = len(fresh) == 0
+    exit_signal = both_below_exit or no_fresh_data
+
+    if exit_signal:
         if state.exit_candidate_since is None:
             state.exit_candidate_since = now_monotonic
 
-        exit_elapsed = (
-            now_monotonic - state.exit_candidate_since
-        )
+        exit_elapsed = now_monotonic - state.exit_candidate_since
 
         if exit_elapsed >= EXIT_CONFIRM_SECONDS:
             state.inside_detection_zone = False
@@ -714,14 +836,17 @@ def process_packet(
 
             print()
             print(
-                f"[ゾーン離脱] "
-                f"{packet.receiver_id} "
-                f"{transmitter.serial_number} "
-                f"RSSI={packet.rssi} dBm"
+                f"[統合ゾーン離脱] "
+                f"{transmitter.serial_number}"
             )
             print("次の通過を受け付けます。")
     else:
         state.exit_candidate_since = None
+
+
+def evaluate_all_gates(connection: sqlite3.Connection) -> None:
+    for transmitter in REGISTERED_TRANSMITTERS:
+        evaluate_gate(connection, transmitter)
 
 
 # ============================================================
@@ -742,14 +867,20 @@ def process_lite_reset_request(
         state.last_lap_monotonic = None
         state.last_lap_datetime = None
         state.lap_count = 0
+
+        state.receiver_states = {
+            receiver_id: ReceiverState()
+            for receiver_id in ACTIVE_RECEIVER_IDS
+        }
+
         state.last_display_monotonic = 0.0
         state.last_rssi_log_monotonic = 0.0
-        state.last_packet_monotonic = 0.0
-        state.last_rssi = None
-        state.last_receiver_id = None
         state.waiting_for_clear_after_reset = True
         state.entry_candidate_since = None
         state.exit_candidate_since = None
+        state.last_gate_valid = False
+        state.last_combined_rssi = None
+        state.last_rssi_difference = None
 
     try:
         RESET_REQUEST_PATH.unlink()
@@ -763,30 +894,14 @@ def process_lite_reset_request(
 
 
 # ============================================================
-# タイムアウト・ステータス
+# ステータス
 # ============================================================
-
-def clear_stale_candidates() -> None:
-    now_monotonic = time.monotonic()
-
-    for state in transmitter_states.values():
-        if state.last_packet_monotonic <= 0:
-            continue
-
-        if (
-            now_monotonic - state.last_packet_monotonic
-            < PACKET_TIMEOUT_SECONDS
-        ):
-            continue
-
-        state.entry_candidate_since = None
-        state.exit_candidate_since = None
-
 
 def print_status() -> None:
     print()
     print()
     print("---------- SGS UDP RX STATUS ----------")
+    print("Version        : 2.0")
     print(f"Listen         : {UDP_BIND_ADDRESS}:{UDP_PORT}")
     print(
         "Active RX      : "
@@ -797,15 +912,20 @@ def print_status() -> None:
     print(f"Invalid packets: {invalid_packet_count}")
     print(f"Unknown TX     : {unknown_transmitter_count}")
     print(f"Inactive RX    : {inactive_receiver_count}")
+    print(f"Parallel reject: {parallel_reject_count}")
 
     for transmitter in REGISTERED_TRANSMITTERS:
         state = transmitter_states[transmitter.serial_number]
+        rx1_rssi = state.receiver_states["RX-0001"].rssi
+        rx2_rssi = state.receiver_states["RX-0002"].rssi
 
         print(
             f"{transmitter.serial_number:<12}: "
             f"lap={state.lap_count:<3} "
-            f"rssi={str(state.last_rssi):>4} "
-            f"rx={state.last_receiver_id or '-'}"
+            f"rx1={str(rx1_rssi):>4} "
+            f"rx2={str(rx2_rssi):>4} "
+            f"diff={str(state.last_rssi_difference):>4} "
+            f"gate={'OK' if state.last_gate_valid else 'NG'}"
         )
 
     print("---------------------------------------")
@@ -832,7 +952,7 @@ class SgsUdpProtocol(asyncio.DatagramProtocol):
 
         print()
         print("============================================")
-        print(" SGS UDP Lap Receiver Version 1.0")
+        print(" SGS UDP Lap Receiver Version 2.0")
         print("============================================")
         print(
             f"[UDP] Listening on "
@@ -841,6 +961,11 @@ class SgsUdpProtocol(asyncio.DatagramProtocol):
         print(
             "[UDP] Active receivers: "
             + ", ".join(sorted(ACTIVE_RECEIVER_IDS))
+        )
+        print("[GATE] Required receivers: RX-0001 + RX-0002")
+        print(
+            "[GATE] Max RSSI difference: "
+            f"{MAX_RECEIVER_RSSI_DIFFERENCE} dB"
         )
         print("[UDP] Waiting for packets...")
         print()
@@ -899,8 +1024,7 @@ class SgsUdpProtocol(asyncio.DatagramProtocol):
 
         valid_packet_count += 1
 
-        process_packet(
-            connection=self.connection,
+        update_receiver_state(
             transmitter=transmitter,
             packet=packet,
         )
@@ -966,7 +1090,7 @@ async def main() -> None:
         try:
             while running:
                 process_lite_reset_request(connection)
-                clear_stale_candidates()
+                evaluate_all_gates(connection)
 
                 now_monotonic = time.monotonic()
 
@@ -977,7 +1101,7 @@ async def main() -> None:
                     print_status()
                     last_status_monotonic = now_monotonic
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
 
         finally:
             transport.close()
