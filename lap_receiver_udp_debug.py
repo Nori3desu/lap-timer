@@ -51,7 +51,7 @@ UDP_PORT = 5000
 UDP_BUFFER_SIZE = 1024
 
 # 現段階ではRX-0001のみでラップ判定
-ACTIVE_RECEIVER_IDS = {"RX-0001"}
+ACTIVE_RECEIVER_IDS = {"RX-0001", "RX-0002"}
 
 
 # ============================================================
