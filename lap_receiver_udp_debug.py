@@ -66,8 +66,6 @@ ENTRY_CONFIRM_SECONDS = 0.8
 EXIT_CONFIRM_SECONDS = 1.5
 
 # ENTRY判定デバッグ表示
-# True  : ENTRY開始・継続・キャンセル・成立を表示
-# False : 通常運用
 DEBUG_ENTRY = True
 
 DISPLAY_INTERVAL_SECONDS = 0.25
@@ -648,8 +646,7 @@ def process_packet(
 
             if DEBUG_ENTRY:
                 print(
-                    f"\r"
-                    f"[ENTRY継続] "
+                    f"\r[ENTRY継続] "
                     f"{packet.receiver_id} "
                     f"{transmitter.serial_number} "
                     f"経過={entry_elapsed:.2f}秒 "
@@ -684,8 +681,7 @@ def process_packet(
                 and state.entry_candidate_since is not None
             ):
                 entry_elapsed = (
-                    now_monotonic
-                    - state.entry_candidate_since
+                    now_monotonic - state.entry_candidate_since
                 )
 
                 print()
