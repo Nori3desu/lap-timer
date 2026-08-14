@@ -79,6 +79,55 @@ def format_datetime(ts):
     )
 
 
+def get_transmitter_battery_statuses():
+    """
+    lap_timer.db の transmitter_battery から
+    送信機ごとの最新Battery状態を取得する。
+
+    Battery機能が未導入・テーブル未作成・DB読込エラーの場合は
+    空リストを返し、Web管理画面を停止させない。
+    """
+    db_path = os.path.join(
+        os.path.dirname(__file__),
+        "lap_timer.db",
+    )
+
+    connection = None
+
+    try:
+        connection = sqlite3.connect(
+            db_path,
+            timeout=5.0,
+        )
+        connection.row_factory = sqlite3.Row
+
+        rows = connection.execute(
+            """
+            SELECT
+                serial_number,
+                udp_transmitter_id,
+                receiver_id,
+                battery_percent,
+                voltage_mv,
+                updated_at
+            FROM transmitter_battery
+            ORDER BY serial_number ASC
+            """
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    except sqlite3.Error as error:
+        print(
+            f"[Battery Web] DB read skipped: {error}"
+        )
+        return []
+
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def get_pi_temperature():
     temp_path = "/sys/class/thermal/thermal_zone0/temp"
 
@@ -682,6 +731,95 @@ def admin():
 
     mode_label = mode_labels.get(setup_mode, setup_mode)
 
+    battery_rows = get_transmitter_battery_statuses()
+
+    if battery_rows:
+        battery_table_rows = ""
+
+        current_time = time.time()
+
+        for battery in battery_rows:
+            serial_number = html.escape(
+                str(battery["serial_number"])
+            )
+            udp_transmitter_id = html.escape(
+                str(battery["udp_transmitter_id"])
+            )
+            receiver_id = html.escape(
+                str(battery["receiver_id"])
+            )
+
+            battery_percent = int(
+                battery["battery_percent"]
+            )
+            voltage_mv = int(
+                battery["voltage_mv"]
+            )
+            voltage_v = voltage_mv / 1000.0
+
+            updated_at = float(
+                battery["updated_at"]
+            )
+            updated_text = format_datetime(
+                updated_at
+            )
+
+            age_seconds = max(
+                0,
+                int(current_time - updated_at),
+            )
+
+            # Battery UDPは約60秒間隔。
+            # 120秒以内なら正常受信中と判断する。
+            if age_seconds <= 120:
+                receive_status = "受信中"
+            elif age_seconds <= 300:
+                receive_status = "直近"
+            else:
+                receive_status = "古い"
+
+            battery_table_rows += f"""
+            <tr>
+                <td>{serial_number}</td>
+                <td><strong>{battery_percent}%</strong></td>
+                <td>{voltage_v:.3f} V</td>
+                <td>{receiver_id}</td>
+                <td>{updated_text}</td>
+                <td>{age_seconds}秒前</td>
+                <td>{receive_status}</td>
+            </tr>
+            """
+
+        battery_html = f"""
+        <section class="battery-section">
+            <h2>送信機バッテリー状態</h2>
+
+            <table class="battery-table">
+                <tr>
+                    <th>送信機</th>
+                    <th>残量</th>
+                    <th>電圧</th>
+                    <th>受信機</th>
+                    <th>最終受信</th>
+                    <th>経過</th>
+                    <th>状態</th>
+                </tr>
+                {battery_table_rows}
+            </table>
+
+            <p class="battery-note">
+                Battery情報は約60秒ごとに更新されます。
+            </p>
+        </section>
+        """
+    else:
+        battery_html = """
+        <section class="battery-section">
+            <h2>送信機バッテリー状態</h2>
+            <p>Battery情報はまだ受信していません。</p>
+        </section>
+        """
+
     return f"""
     <html>
     <head>
@@ -706,6 +844,41 @@ def admin():
                 margin-top: 14px;
                 font-size: 18px;
             }}
+
+            .battery-section {{
+                margin: 24px 0;
+                padding: 16px;
+                border: 1px solid #ccc;
+                border-radius: 8px;
+                overflow-x: auto;
+            }}
+
+            .battery-section h2 {{
+                margin-top: 0;
+            }}
+
+            .battery-table {{
+                width: 100%;
+                border-collapse: collapse;
+                min-width: 720px;
+            }}
+
+            .battery-table th,
+            .battery-table td {{
+                padding: 10px 8px;
+                border-bottom: 1px solid #ddd;
+                text-align: left;
+                white-space: nowrap;
+            }}
+
+            .battery-table th {{
+                background: #f3f3f3;
+            }}
+
+            .battery-note {{
+                margin-bottom: 0;
+                font-size: 14px;
+            }}
         </style>
     </head>
 
@@ -716,6 +889,8 @@ def admin():
             製品モード:
             <strong>{product_mode_label}</strong>
         </p>
+
+        {battery_html}
 
                 {""
         if is_lite else
