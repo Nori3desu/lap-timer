@@ -776,39 +776,63 @@ def admin():
             elif age_seconds <= 300:
                 receive_status = "直近"
             else:
-                receive_status = "古い"
+                receive_status = "通信なし"
+
+            if battery_percent >= 70:
+                battery_class = "battery-good"
+            elif battery_percent >= 30:
+                battery_class = "battery-warning"
+            else:
+                battery_class = "battery-low"
+
+            if receive_status == "受信中":
+                status_class = "status-online"
+            elif receive_status == "直近":
+                status_class = "status-recent"
+            else:
+                status_class = "status-offline"
 
             battery_table_rows += f"""
-            <tr>
-                <td>{serial_number}</td>
-                <td><strong>{battery_percent}%</strong></td>
-                <td>{voltage_v:.3f} V</td>
-                <td>{receiver_id}</td>
-                <td>{updated_text}</td>
-                <td>{age_seconds}秒前</td>
-                <td>{receive_status}</td>
-            </tr>
+            <div class="battery-card">
+                <div class="battery-card-top">
+                    <div class="battery-device">{serial_number}</div>
+                    <div class="battery-percent {battery_class}">
+                        {battery_percent}%
+                    </div>
+                </div>
+
+                <div class="battery-grid">
+                    <div class="battery-label">電圧</div>
+                    <div>{voltage_v:.3f} V</div>
+
+                    <div class="battery-label">受信機</div>
+                    <div>{receiver_id}</div>
+
+                    <div class="battery-label">最終受信</div>
+                    <div>{updated_text}</div>
+
+                    <div class="battery-label">経過</div>
+                    <div>{age_seconds}秒前</div>
+
+                    <div class="battery-label">状態</div>
+                    <div class="{status_class}">
+                        <strong>{receive_status}</strong>
+                    </div>
+                </div>
+            </div>
             """
 
         battery_html = f"""
         <section class="battery-section">
             <h2>送信機バッテリー状態</h2>
 
-            <table class="battery-table">
-                <tr>
-                    <th>送信機</th>
-                    <th>残量</th>
-                    <th>電圧</th>
-                    <th>受信機</th>
-                    <th>最終受信</th>
-                    <th>経過</th>
-                    <th>状態</th>
-                </tr>
+            <div class="battery-card-list">
                 {battery_table_rows}
-            </table>
+            </div>
 
             <p class="battery-note">
                 Battery情報は約60秒ごとに更新されます。
+                最終受信から5分を超えると「通信なし」と表示します。
             </p>
         </section>
         """
@@ -850,34 +874,105 @@ def admin():
                 padding: 16px;
                 border: 1px solid #ccc;
                 border-radius: 8px;
-                overflow-x: auto;
             }}
 
             .battery-section h2 {{
                 margin-top: 0;
             }}
 
-            .battery-table {{
-                width: 100%;
-                border-collapse: collapse;
-                min-width: 720px;
+            .battery-card-list {{
+                display: grid;
+                gap: 12px;
             }}
 
-            .battery-table th,
-            .battery-table td {{
-                padding: 10px 8px;
-                border-bottom: 1px solid #ddd;
-                text-align: left;
-                white-space: nowrap;
+            .battery-card {{
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 14px;
+                background: #fafafa;
             }}
 
-            .battery-table th {{
-                background: #f3f3f3;
+            .battery-card-top {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            }}
+
+            .battery-device {{
+                font-size: 20px;
+                font-weight: bold;
+            }}
+
+            .battery-percent {{
+                font-size: 26px;
+                font-weight: bold;
+                padding: 6px 12px;
+                border-radius: 999px;
+            }}
+
+            .battery-good {{
+                background: #dff3e4;
+                color: #176b2c;
+            }}
+
+            .battery-warning {{
+                background: #fff1bf;
+                color: #775a00;
+            }}
+
+            .battery-low {{
+                background: #f8d7da;
+                color: #8a1f2d;
+            }}
+
+            .battery-grid {{
+                display: grid;
+                grid-template-columns: 90px 1fr;
+                gap: 8px 12px;
+                align-items: center;
+            }}
+
+            .battery-label {{
+                font-weight: bold;
+                color: #555;
+            }}
+
+            .status-online {{
+                color: #176b2c;
+            }}
+
+            .status-recent {{
+                color: #775a00;
+            }}
+
+            .status-offline {{
+                color: #8a1f2d;
             }}
 
             .battery-note {{
                 margin-bottom: 0;
                 font-size: 14px;
+            }}
+
+            @media (max-width: 520px) {{
+                .battery-section {{
+                    padding: 12px;
+                }}
+
+                .battery-grid {{
+                    grid-template-columns: 78px 1fr;
+                    font-size: 14px;
+                }}
+
+                .battery-device {{
+                    font-size: 18px;
+                }}
+
+                .battery-percent {{
+                    font-size: 22px;
+                }}
             }}
         </style>
     </head>
