@@ -81,11 +81,8 @@ def format_datetime(ts):
 
 def get_transmitter_battery_statuses():
     """
-    lap_timer.db の transmitter_battery から
-    送信機ごとの最新Battery状態を取得する。
-
-    Battery機能が未導入・テーブル未作成・DB読込エラーの場合は
-    空リストを返し、Web管理画面を停止させない。
+    RX別Batteryテーブルから送信機ごとの最新Battery状態を取得する。
+    新テーブルがまだ無い場合は従来テーブルへフォールバックする。
     """
     db_path = os.path.join(
         os.path.dirname(__file__),
@@ -101,21 +98,66 @@ def get_transmitter_battery_statuses():
         )
         connection.row_factory = sqlite3.Row
 
-        rows = connection.execute(
+        table_exists = connection.execute(
             """
-            SELECT
-                serial_number,
-                udp_transmitter_id,
-                receiver_id,
-                battery_percent,
-                voltage_mv,
-                updated_at
-            FROM transmitter_battery
-            ORDER BY serial_number ASC
+            SELECT 1
+            FROM sqlite_master
+            WHERE type='table'
+              AND name='transmitter_battery_receivers'
             """
-        ).fetchall()
+        ).fetchone()
 
-        return [dict(row) for row in rows]
+        if table_exists:
+            rows = connection.execute(
+                """
+                SELECT
+                    serial_number,
+                    udp_transmitter_id,
+                    receiver_id,
+                    battery_percent,
+                    voltage_mv,
+                    updated_at
+                FROM transmitter_battery_receivers
+                ORDER BY serial_number ASC, receiver_id ASC
+                """
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT
+                    serial_number,
+                    udp_transmitter_id,
+                    receiver_id,
+                    battery_percent,
+                    voltage_mv,
+                    updated_at
+                FROM transmitter_battery
+                ORDER BY serial_number ASC
+                """
+            ).fetchall()
+
+        grouped = {}
+
+        for row in rows:
+            serial_number = row["serial_number"]
+
+            if serial_number not in grouped:
+                grouped[serial_number] = {
+                    "serial_number": serial_number,
+                    "udp_transmitter_id": row["udp_transmitter_id"],
+                    "receivers": [],
+                }
+
+            grouped[serial_number]["receivers"].append(
+                {
+                    "receiver_id": row["receiver_id"],
+                    "battery_percent": row["battery_percent"],
+                    "voltage_mv": row["voltage_mv"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+
+        return list(grouped.values())
 
     except sqlite3.Error as error:
         print(
@@ -734,49 +776,68 @@ def admin():
     battery_rows = get_transmitter_battery_statuses()
 
     if battery_rows:
-        battery_table_rows = ""
-
+        battery_cards = ""
         current_time = time.time()
 
         for battery in battery_rows:
             serial_number = html.escape(
                 str(battery["serial_number"])
             )
-            udp_transmitter_id = html.escape(
-                str(battery["udp_transmitter_id"])
-            )
-            receiver_id = html.escape(
-                str(battery["receiver_id"])
-            )
+
+            receiver_rows_html = ""
+            freshest_receiver = None
+
+            for receiver in battery["receivers"]:
+                updated_at = float(receiver["updated_at"])
+                age_seconds = max(
+                    0,
+                    int(current_time - updated_at),
+                )
+
+                if age_seconds <= 120:
+                    receive_status = "受信中"
+                    status_class = "status-online"
+                elif age_seconds <= 300:
+                    receive_status = "直近"
+                    status_class = "status-recent"
+                else:
+                    receive_status = "通信なし"
+                    status_class = "status-offline"
+
+                if (
+                    freshest_receiver is None
+                    or updated_at > freshest_receiver["updated_at"]
+                ):
+                    freshest_receiver = {
+                        **receiver,
+                        "updated_at": updated_at,
+                    }
+
+                receiver_id = html.escape(
+                    str(receiver["receiver_id"])
+                )
+
+                receiver_rows_html += f"""
+                <div class="receiver-row">
+                    <div class="receiver-name">{receiver_id}</div>
+                    <div class="{status_class}">
+                        <strong>{receive_status}</strong>
+                    </div>
+                    <div>{age_seconds}秒前</div>
+                    <div>{format_datetime(updated_at)}</div>
+                </div>
+                """
+
+            if freshest_receiver is None:
+                continue
 
             battery_percent = int(
-                battery["battery_percent"]
+                freshest_receiver["battery_percent"]
             )
             voltage_mv = int(
-                battery["voltage_mv"]
+                freshest_receiver["voltage_mv"]
             )
             voltage_v = voltage_mv / 1000.0
-
-            updated_at = float(
-                battery["updated_at"]
-            )
-            updated_text = format_datetime(
-                updated_at
-            )
-
-            age_seconds = max(
-                0,
-                int(current_time - updated_at),
-            )
-
-            # Battery UDPは約60秒間隔。
-            # 120秒以内なら正常受信中と判断する。
-            if age_seconds <= 120:
-                receive_status = "受信中"
-            elif age_seconds <= 300:
-                receive_status = "直近"
-            else:
-                receive_status = "通信なし"
 
             if battery_percent >= 70:
                 battery_class = "battery-good"
@@ -785,14 +846,7 @@ def admin():
             else:
                 battery_class = "battery-low"
 
-            if receive_status == "受信中":
-                status_class = "status-online"
-            elif receive_status == "直近":
-                status_class = "status-recent"
-            else:
-                status_class = "status-offline"
-
-            battery_table_rows += f"""
+            battery_cards += f"""
             <div class="battery-card">
                 <div class="battery-card-top">
                     <div class="battery-device">{serial_number}</div>
@@ -801,23 +855,18 @@ def admin():
                     </div>
                 </div>
 
-                <div class="battery-grid">
-                    <div class="battery-label">電圧</div>
-                    <div>{voltage_v:.3f} V</div>
+                <div class="battery-voltage">
+                    電圧: <strong>{voltage_v:.3f} V</strong>
+                </div>
 
-                    <div class="battery-label">受信機</div>
-                    <div>{receiver_id}</div>
-
-                    <div class="battery-label">最終受信</div>
-                    <div>{updated_text}</div>
-
-                    <div class="battery-label">経過</div>
-                    <div>{age_seconds}秒前</div>
-
-                    <div class="battery-label">状態</div>
-                    <div class="{status_class}">
-                        <strong>{receive_status}</strong>
+                <div class="receiver-list">
+                    <div class="receiver-header">
+                        <div>受信機</div>
+                        <div>状態</div>
+                        <div>経過</div>
+                        <div>最終受信</div>
                     </div>
+                    {receiver_rows_html}
                 </div>
             </div>
             """
@@ -827,12 +876,13 @@ def admin():
             <h2>送信機バッテリー状態</h2>
 
             <div class="battery-card-list">
-                {battery_table_rows}
+                {battery_cards}
             </div>
 
             <p class="battery-note">
                 Battery情報は約60秒ごとに更新されます。
-                最終受信から5分を超えると「通信なし」と表示します。
+                各RXについて、最終受信から5分を超えると
+                「通信なし」と表示します。
             </p>
         </section>
         """
@@ -951,6 +1001,40 @@ def admin():
                 color: #8a1f2d;
             }}
 
+            .battery-voltage {{
+                margin-bottom: 14px;
+                font-size: 17px;
+            }}
+
+            .receiver-list {{
+                display: grid;
+                gap: 6px;
+            }}
+
+            .receiver-header,
+            .receiver-row {{
+                display: grid;
+                grid-template-columns: 90px 90px 80px 1fr;
+                gap: 8px;
+                align-items: center;
+                padding: 7px 0;
+            }}
+
+            .receiver-header {{
+                font-size: 13px;
+                font-weight: bold;
+                color: #555;
+                border-bottom: 1px solid #ddd;
+            }}
+
+            .receiver-row {{
+                border-bottom: 1px solid #eee;
+            }}
+
+            .receiver-name {{
+                font-weight: bold;
+            }}
+
             .battery-note {{
                 margin-bottom: 0;
                 font-size: 14px;
@@ -972,6 +1056,17 @@ def admin():
 
                 .battery-percent {{
                     font-size: 22px;
+                }}
+
+                .receiver-header,
+                .receiver-row {{
+                    grid-template-columns: 72px 72px 62px 1fr;
+                    gap: 6px;
+                    font-size: 12px;
+                }}
+
+                .receiver-header {{
+                    font-size: 11px;
                 }}
             }}
         </style>
