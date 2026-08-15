@@ -79,6 +79,24 @@ def format_datetime(ts):
     )
 
 
+def transmitter_name_from_mac(mac_address):
+    """
+    BLE MACアドレスから送信機名を生成する。
+    例: 6B:EB:E2:4D:FE:95 -> TX-4DFE95
+    """
+    compact_mac = (
+        (mac_address or "")
+        .replace(":", "")
+        .replace("-", "")
+        .upper()
+    )
+
+    if len(compact_mac) >= 6:
+        return "TX-" + compact_mac[-6:]
+
+    return "TX-UNKNOWN"
+
+
 def get_transmitter_battery_statuses():
     """
     RX別Batteryテーブルから送信機ごとの最新Battery状態を取得する。
@@ -1552,7 +1570,7 @@ def rssi_monitor():
         <table>
             <tr>
                 <th>Name</th>
-                <th>MAC</th>
+                <th>送信機</th>
                 <th>最新RSSI</th>
                 <th>最終受信</th>
                 <th>状態</th>
@@ -1573,6 +1591,7 @@ def rssi_monitor():
     for mac, s in stats.items():
         avg = s["sum"] / s["count"]
 
+        transmitter_name = transmitter_name_from_mac(mac)
         latest = s["latest"]
         
         age_sec = int(time.time() - s["created_at"])
@@ -1594,7 +1613,7 @@ def rssi_monitor():
         html_text += f"""
             <tr>
                 <td>{html.escape(s["name"] or "")}</td>
-                <td>{html.escape(mac)}</td>
+                <td>{html.escape(transmitter_name)}</td>
                 <td class="strong">{latest}</td>
                 <td>{age_sec}秒前</td>
                 <td>{status}</td>
