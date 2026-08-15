@@ -163,7 +163,13 @@ class TransmitterState:
     )
 
     last_display_monotonic: float = 0.0
-    last_rssi_log_monotonic: float = 0.0
+
+    last_rssi_log_monotonic: dict[str, float] = field(
+        default_factory=lambda: {
+            receiver_id: 0.0
+            for receiver_id in ACTIVE_RECEIVER_IDS
+        }
+    )
 
     waiting_for_clear_after_reset: bool = False
     entry_candidate_since: float | None = None
@@ -371,15 +377,17 @@ def save_web_rssi_log(
             """
             INSERT INTO rssi_logs (
                 mac_address,
+                receiver_id,
                 name,
                 major,
                 rssi,
                 timestamp
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 packet.mac_address,
+                packet.receiver_id,
                 transmitter.rider_name,
                 transmitter.major,
                 packet.rssi,
@@ -618,15 +626,25 @@ def update_receiver_state(
     receiver_state.last_packet_monotonic = now_monotonic
     receiver_state.last_packet = packet
 
+    last_log_monotonic = (
+        state.last_rssi_log_monotonic.get(
+            packet.receiver_id,
+            0.0,
+        )
+    )
+
     if (
-        now_monotonic - state.last_rssi_log_monotonic
+        now_monotonic - last_log_monotonic
         >= RSSI_LOG_INTERVAL_SECONDS
     ):
         save_web_rssi_log(
             transmitter=transmitter,
             packet=packet,
         )
-        state.last_rssi_log_monotonic = now_monotonic
+
+        state.last_rssi_log_monotonic[
+            packet.receiver_id
+        ] = now_monotonic
 
 
 def evaluate_gate(
@@ -827,7 +845,12 @@ def process_lite_reset_request(
         }
 
         state.last_display_monotonic = 0.0
-        state.last_rssi_log_monotonic = 0.0
+
+        state.last_rssi_log_monotonic = {
+            receiver_id: 0.0
+            for receiver_id in ACTIVE_RECEIVER_IDS
+        }
+
         state.waiting_for_clear_after_reset = True
         state.entry_candidate_since = None
         state.exit_candidate_since = None

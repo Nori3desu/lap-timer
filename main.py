@@ -1499,9 +1499,14 @@ def rssi_monitor():
 
     for log in logs:
         mac = log["mac_address"]
+        receiver_id = log.get("receiver_id") or "RX-UNKNOWN"
 
-        if mac not in stats:
-            stats[mac] = {
+        key = (mac, receiver_id)
+
+        if key not in stats:
+            stats[key] = {
+                "mac_address": mac,
+                "receiver_id": receiver_id,
                 "name": log["name"],
                 "major": log["major"],
                 "latest": log["rssi"],
@@ -1509,19 +1514,31 @@ def rssi_monitor():
                 "max": log["rssi"],
                 "sum": 0,
                 "count": 0,
-                "created_at": log.get("created_at", log.get("timestamp", 0)),
+                "created_at": log.get(
+                    "created_at",
+                    log.get("timestamp", 0),
+                ),
             }
 
-        stats[mac]["min"] = min(stats[mac]["min"], log["rssi"])
-        stats[mac]["max"] = max(stats[mac]["max"], log["rssi"])
-        stats[mac]["count"] += 1
-        stats[mac]["sum"] += log["rssi"]
+        stats[key]["min"] = min(
+            stats[key]["min"],
+            log["rssi"],
+        )
+        stats[key]["max"] = max(
+            stats[key]["max"],
+            log["rssi"],
+        )
+        stats[key]["count"] += 1
+        stats[key]["sum"] += log["rssi"]
 
-        log_created_at = log.get("created_at", log.get("timestamp", 0))
-        
-        if log_created_at > stats[mac]["created_at"]:
-            stats[mac]["created_at"] = log_created_at
-            stats[mac]["latest"] = log["rssi"]
+        log_created_at = log.get(
+            "created_at",
+            log.get("timestamp", 0),
+        )
+
+        if log_created_at > stats[key]["created_at"]:
+            stats[key]["created_at"] = log_created_at
+            stats[key]["latest"] = log["rssi"]
 
     html_text = f"""
     
@@ -1571,6 +1588,7 @@ def rssi_monitor():
             <tr>
                 <th>Name</th>
                 <th>送信機</th>
+                <th>受信機</th>
                 <th>最新RSSI</th>
                 <th>最終受信</th>
                 <th>状態</th>
@@ -1584,16 +1602,25 @@ def rssi_monitor():
     if not stats:
         html_text += """
             <tr>
-                <td colspan="9">RSSIログなし</td>
+                <td colspan="10">RSSIログなし</td>
             </tr>
         """
 
-    for mac, s in stats.items():
+    for key, s in sorted(
+        stats.items(),
+        key=lambda item: (
+            item[1]["mac_address"],
+            item[1]["receiver_id"],
+        ),
+    ):
         avg = s["sum"] / s["count"]
+
+        mac = s["mac_address"]
+        receiver_id = s["receiver_id"]
 
         transmitter_name = transmitter_name_from_mac(mac)
         latest = s["latest"]
-        
+
         age_sec = int(time.time() - s["created_at"])
 
         if age_sec <= 3:
@@ -1614,6 +1641,7 @@ def rssi_monitor():
             <tr>
                 <td>{html.escape(s["name"] or "")}</td>
                 <td>{html.escape(transmitter_name)}</td>
+                <td><strong>{html.escape(receiver_id)}</strong></td>
                 <td class="strong">{latest}</td>
                 <td>{age_sec}秒前</td>
                 <td>{status}</td>

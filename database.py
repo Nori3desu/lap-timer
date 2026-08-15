@@ -67,6 +67,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS rssi_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         mac_address TEXT NOT NULL,
+        receiver_id TEXT,
         name TEXT,
         major INTEGER,
         rssi INTEGER NOT NULL,
@@ -78,6 +79,15 @@ def init_db():
         cur.execute("""
         ALTER TABLE laps
         ADD COLUMN race_id INTEGER
+        """)
+    except Exception:
+        pass
+
+
+    try:
+        cur.execute("""
+        ALTER TABLE rssi_logs
+        ADD COLUMN receiver_id TEXT
         """)
     except Exception:
         pass
@@ -658,7 +668,13 @@ def get_races():
 
     return [dict(row) for row in rows]
 
-def save_rssi_log(mac_address, name, major, rssi):
+def save_rssi_log(
+    mac_address,
+    receiver_id,
+    name,
+    major,
+    rssi
+):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -667,14 +683,16 @@ def save_rssi_log(mac_address, name, major, rssi):
     cur.execute("""
     INSERT INTO rssi_logs (
         mac_address,
+        receiver_id,
         name,
         major,
         rssi,
         timestamp
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
     """, (
         mac_address,
+        receiver_id,
         name,
         major,
         rssi,
@@ -692,6 +710,7 @@ def get_latest_rssi_logs(limit=100):
     cur.execute("""
     SELECT
         mac_address,
+        receiver_id,
         name,
         major,
         rssi,
