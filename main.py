@@ -1490,7 +1490,6 @@ def analyze_rssi_logs():
     }
 
 @app.get("/admin/rssi-monitor", response_class=HTMLResponse)
-
 def rssi_monitor():
     logs = get_latest_rssi_logs(100)
     settings = get_rssi_settings()
@@ -1540,130 +1539,621 @@ def rssi_monitor():
             stats[key]["created_at"] = log_created_at
             stats[key]["latest"] = log["rssi"]
 
+    grouped = {}
+
+    for _, s in stats.items():
+        mac = s["mac_address"]
+
+        if mac not in grouped:
+            grouped[mac] = {
+                "name": s["name"],
+                "mac_address": mac,
+                "receivers": [],
+            }
+
+        grouped[mac]["receivers"].append(s)
+
     html_text = f"""
-    
     <html>
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta http-equiv="refresh" content="5">
         <title>RSSIモニタ</title>
-        <style>
 
-            body {{ font-family: sans-serif; padding: 16px; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
-            th, td {{ border-bottom: 1px solid #ccc; padding: 8px; text-align: left; }}
-            th {{ background: #eee; }}
-            .strong {{ font-weight: bold; }}
+        <style>
+            * {{
+                box-sizing: border-box;
+            }}
+
+            body {{
+                margin: 0;
+                background: #f3f6fa;
+                color: #172033;
+                font-family:
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "Segoe UI",
+                    sans-serif;
+            }}
+
+            .page {{
+                width: 100%;
+                max-width: 760px;
+                margin: 0 auto;
+                padding: 18px 14px 32px;
+            }}
+
+            .topbar {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 18px;
+            }}
+
+            .back-link {{
+                color: #325bd6;
+                text-decoration: none;
+                font-size: 15px;
+            }}
+
+            .refresh {{
+                font-size: 13px;
+                color: #687386;
+                white-space: nowrap;
+            }}
+
+            h1 {{
+                margin: 4px 0 18px;
+                font-size: 30px;
+                line-height: 1.2;
+            }}
+
+            .settings-card {{
+                background: white;
+                border-radius: 16px;
+                padding: 16px;
+                margin-bottom: 16px;
+                box-shadow: 0 3px 14px rgba(20, 35, 60, 0.08);
+            }}
+
+            .settings-title {{
+                font-weight: 700;
+                margin-bottom: 10px;
+            }}
+
+            .settings-grid {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 8px 12px;
+                font-size: 14px;
+            }}
+
+            .settings-item {{
+                background: #f7f9fc;
+                border-radius: 10px;
+                padding: 10px;
+            }}
+
+            .settings-label {{
+                color: #667085;
+                font-size: 12px;
+                margin-bottom: 3px;
+            }}
+
+            .settings-value {{
+                font-weight: 700;
+                font-size: 18px;
+            }}
+
+            .links {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                margin-bottom: 18px;
+            }}
+
+            .action-link {{
+                display: inline-block;
+                background: white;
+                color: #325bd6;
+                text-decoration: none;
+                border-radius: 10px;
+                padding: 10px 12px;
+                font-size: 14px;
+                box-shadow: 0 2px 8px rgba(20, 35, 60, 0.06);
+            }}
+
+            .device-card {{
+                background: white;
+                border-radius: 18px;
+                padding: 16px;
+                margin-bottom: 18px;
+                box-shadow: 0 4px 16px rgba(20, 35, 60, 0.09);
+            }}
+
+            .device-header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-start;
+                gap: 12px;
+                margin-bottom: 14px;
+            }}
+
+            .device-name {{
+                font-size: 21px;
+                font-weight: 800;
+            }}
+
+            .tx-name {{
+                color: #667085;
+                font-size: 14px;
+                font-weight: 600;
+                margin-top: 2px;
+            }}
+
+            .rx-list {{
+                display: grid;
+                gap: 12px;
+            }}
+
+            .rx-card {{
+                border-radius: 14px;
+                padding: 14px;
+                border: 1px solid #e4e9f2;
+                background: #fbfcfe;
+            }}
+
+            .rx-top {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 10px;
+            }}
+
+            .rx-id {{
+                font-size: 17px;
+                font-weight: 800;
+                white-space: nowrap;
+            }}
+
+            .status-badge {{
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 6px 10px;
+                border-radius: 999px;
+                font-size: 13px;
+                font-weight: 700;
+                white-space: nowrap;
+            }}
+
+            .status-online {{
+                color: #126a35;
+                background: #dcf4e6;
+            }}
+
+            .status-recent {{
+                color: #8a6500;
+                background: #fff2c2;
+            }}
+
+            .status-old {{
+                color: #9d2936;
+                background: #fde2e5;
+            }}
+
+            .dot {{
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: currentColor;
+            }}
+
+            .rssi-row {{
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-end;
+                gap: 10px;
+                margin-top: 12px;
+            }}
+
+            .rssi-value {{
+                font-size: 42px;
+                line-height: 1;
+                font-weight: 850;
+                letter-spacing: -1px;
+            }}
+
+            .dbm {{
+                font-size: 16px;
+                color: #667085;
+                font-weight: 600;
+                margin-left: 4px;
+            }}
+
+            .judge {{
+                font-size: 14px;
+                font-weight: 700;
+                color: #42526a;
+                background: #eef2f7;
+                border-radius: 10px;
+                padding: 7px 10px;
+                white-space: nowrap;
+            }}
+
+            .meta-grid {{
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 8px;
+                margin-top: 14px;
+            }}
+
+            .meta-item {{
+                background: white;
+                border: 1px solid #edf0f4;
+                border-radius: 10px;
+                padding: 9px 6px;
+                text-align: center;
+            }}
+
+            .meta-label {{
+                color: #7a8494;
+                font-size: 11px;
+                margin-bottom: 3px;
+            }}
+
+            .meta-value {{
+                font-size: 14px;
+                font-weight: 700;
+                white-space: nowrap;
+            }}
+
+            .balance-card {{
+                margin-top: 14px;
+                background: #fff7d8;
+                border: 1px solid #f2df8f;
+                border-radius: 12px;
+                padding: 12px;
+                text-align: center;
+            }}
+
+            .balance-title {{
+                font-size: 12px;
+                color: #806a17;
+                margin-bottom: 3px;
+            }}
+
+            .balance-value {{
+                font-size: 24px;
+                font-weight: 850;
+                color: #6c5812;
+            }}
+
+            .help-card {{
+                background: white;
+                border-radius: 16px;
+                padding: 16px;
+                box-shadow: 0 3px 14px rgba(20, 35, 60, 0.07);
+            }}
+
+            .help-card h2 {{
+                font-size: 18px;
+                margin: 0 0 10px;
+            }}
+
+            .help-card p {{
+                font-size: 14px;
+                line-height: 1.6;
+                margin: 6px 0;
+                color: #4e5968;
+            }}
+
+            .empty {{
+                background: white;
+                border-radius: 16px;
+                padding: 24px;
+                text-align: center;
+                color: #667085;
+            }}
+
+            @media (max-width: 520px) {{
+                .page {{
+                    padding: 14px 12px 26px;
+                }}
+
+                h1 {{
+                    font-size: 28px;
+                }}
+
+                .settings-grid {{
+                    grid-template-columns: 1fr 1fr;
+                }}
+
+                .meta-grid {{
+                    grid-template-columns: repeat(2, 1fr);
+                }}
+
+                .rssi-value {{
+                    font-size: 38px;
+                }}
+            }}
         </style>
     </head>
+
     <body>
-        <a href="/admin">← 管理者メニューへ戻る</a>
+        <div class="page">
 
-        <h1>RSSIモニタ</h1>
+            <div class="topbar">
+                <a class="back-link" href="/admin">
+                    ← 管理者メニュー
+                </a>
 
-        <p>5秒ごとに自動更新します。</p>
+                <div class="refresh">
+                    5秒ごとに自動更新
+                </div>
+            </div>
 
-                <div style="background:#f5f5f5; padding:12px; margin:12px 0;">
-            <strong>現在のRSSI設定</strong><br>
-            ENTER_RSSI_THRESHOLD（近づいた判定）:
-            {settings["enter_rssi_threshold"]}<br>
-            EXIT_RSSI_THRESHOLD（離れた判定）:
-            {settings["exit_rssi_threshold"]}<br>
-            COOLDOWN_SEC:
-            {settings["cooldown_sec"]}<br>
-            MIN_LAP_TIME_SEC:
-            {settings["min_lap_time_sec"]}
-        </div>
+            <h1>RSSIモニタ</h1>
 
-        <p>
-            <a href="/admin/rssi-settings">RSSI設定を変更する</a>
-            <br>
-            <a href="/admin/rssi-analyze">RSSI自動分析を見る</a>
+            <div class="settings-card">
+                <div class="settings-title">
+                    現在のRSSI設定
+                </div>
 
-        </p>
+                <div class="settings-grid">
+                    <div class="settings-item">
+                        <div class="settings-label">
+                            ENTER
+                        </div>
+                        <div class="settings-value">
+                            {settings["enter_rssi_threshold"]}
+                        </div>
+                    </div>
 
+                    <div class="settings-item">
+                        <div class="settings-label">
+                            EXIT
+                        </div>
+                        <div class="settings-value">
+                            {settings["exit_rssi_threshold"]}
+                        </div>
+                    </div>
 
-        <table>
-            <tr>
-                <th>Name</th>
-                <th>送信機</th>
-                <th>受信機</th>
-                <th>最新RSSI</th>
-                <th>最終受信</th>
-                <th>状態</th>
-                <th>最大</th>
-                <th>最小</th>
-                <th>平均</th>
-                <th>判定目安</th>
-            </tr>
+                    <div class="settings-item">
+                        <div class="settings-label">
+                            COOLDOWN
+                        </div>
+                        <div class="settings-value">
+                            {settings["cooldown_sec"]} 秒
+                        </div>
+                    </div>
+
+                    <div class="settings-item">
+                        <div class="settings-label">
+                            MIN LAP
+                        </div>
+                        <div class="settings-value">
+                            {settings["min_lap_time_sec"]} 秒
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="links">
+                <a class="action-link" href="/admin/rssi-settings">
+                    RSSI設定を変更
+                </a>
+
+                <a class="action-link" href="/admin/rssi-analyze">
+                    RSSI自動分析
+                </a>
+            </div>
     """
 
-    if not stats:
+    if not grouped:
         html_text += """
-            <tr>
-                <td colspan="10">RSSIログなし</td>
-            </tr>
+            <div class="empty">
+                RSSIログなし
+            </div>
         """
+    else:
+        for mac, device in grouped.items():
+            transmitter_name = transmitter_name_from_mac(mac)
 
-    for key, s in sorted(
-        stats.items(),
-        key=lambda item: (
-            item[1]["mac_address"],
-            item[1]["receiver_id"],
-        ),
-    ):
-        avg = s["sum"] / s["count"]
+            receivers = sorted(
+                device["receivers"],
+                key=lambda item: item["receiver_id"],
+            )
 
-        mac = s["mac_address"]
-        receiver_id = s["receiver_id"]
+            rx_values = []
 
-        transmitter_name = transmitter_name_from_mac(mac)
-        latest = s["latest"]
+            html_text += f"""
+            <section class="device-card">
 
-        age_sec = int(time.time() - s["created_at"])
+                <div class="device-header">
+                    <div>
+                        <div class="device-name">
+                            {html.escape(device["name"] or "")}
+                        </div>
 
-        if age_sec <= 3:
-            status = "受信中"
-        elif age_sec <= 10:
-            status = "直近"
-        else:
-            status = "古い"
+                        <div class="tx-name">
+                            {html.escape(transmitter_name)}
+                        </div>
+                    </div>
+                </div>
 
-        if latest >= -55:
-            judge = "近接"
-        elif latest <= -70:
-            judge = "離れ"
-        else:
-            judge = "中間"
+                <div class="rx-list">
+            """
 
-        html_text += f"""
-            <tr>
-                <td>{html.escape(s["name"] or "")}</td>
-                <td>{html.escape(transmitter_name)}</td>
-                <td><strong>{html.escape(receiver_id)}</strong></td>
-                <td class="strong">{latest}</td>
-                <td>{age_sec}秒前</td>
-                <td>{status}</td>
-                <td>{s["max"]}</td>
-                <td>{s["min"]}</td>
-                <td>{avg:.1f}</td>
-                <td>{judge}</td>
-            </tr>
-        """
+            for s in receivers:
+                latest = s["latest"]
+                avg = s["sum"] / s["count"]
+                receiver_id = s["receiver_id"]
+
+                age_sec = int(
+                    time.time() - s["created_at"]
+                )
+
+                if age_sec <= 3:
+                    status = "受信中"
+                    status_class = "status-online"
+                elif age_sec <= 10:
+                    status = "直近"
+                    status_class = "status-recent"
+                else:
+                    status = "古い"
+                    status_class = "status-old"
+
+                if latest >= -55:
+                    judge = "近接"
+                elif latest <= -70:
+                    judge = "離れ"
+                else:
+                    judge = "中間"
+
+                rx_values.append(
+                    (
+                        receiver_id,
+                        latest,
+                    )
+                )
+
+                html_text += f"""
+                    <div class="rx-card">
+
+                        <div class="rx-top">
+                            <div class="rx-id">
+                                {html.escape(receiver_id)}
+                            </div>
+
+                            <div class="status-badge {status_class}">
+                                <span class="dot"></span>
+                                {status}
+                            </div>
+                        </div>
+
+                        <div class="rssi-row">
+                            <div>
+                                <span class="rssi-value">
+                                    {latest}
+                                </span>
+                                <span class="dbm">
+                                    dBm
+                                </span>
+                            </div>
+
+                            <div class="judge">
+                                {judge}
+                            </div>
+                        </div>
+
+                        <div class="meta-grid">
+
+                            <div class="meta-item">
+                                <div class="meta-label">
+                                    最終受信
+                                </div>
+                                <div class="meta-value">
+                                    {age_sec}秒前
+                                </div>
+                            </div>
+
+                            <div class="meta-item">
+                                <div class="meta-label">
+                                    最大
+                                </div>
+                                <div class="meta-value">
+                                    {s["max"]}
+                                </div>
+                            </div>
+
+                            <div class="meta-item">
+                                <div class="meta-label">
+                                    最小
+                                </div>
+                                <div class="meta-value">
+                                    {s["min"]}
+                                </div>
+                            </div>
+
+                            <div class="meta-item">
+                                <div class="meta-label">
+                                    平均
+                                </div>
+                                <div class="meta-value">
+                                    {avg:.1f}
+                                </div>
+                            </div>
+
+                        </div>
+
+                    </div>
+                """
+
+            html_text += """
+                </div>
+            """
+
+            if len(rx_values) >= 2:
+                rx_map = {
+                    receiver_id: rssi
+                    for receiver_id, rssi in rx_values
+                }
+
+                if (
+                    "RX-0001" in rx_map
+                    and "RX-0002" in rx_map
+                ):
+                    difference = abs(
+                        rx_map["RX-0001"]
+                        - rx_map["RX-0002"]
+                    )
+
+                    html_text += f"""
+                    <div class="balance-card">
+                        <div class="balance-title">
+                            RX-0001 / RX-0002 RSSI差
+                        </div>
+
+                        <div class="balance-value">
+                            {difference} dB
+                        </div>
+                    </div>
+                    """
+
+            html_text += """
+            </section>
+            """
 
     html_text += """
-        </table>
+            <div class="help-card">
+                <h2>使い方</h2>
 
-        <h2>使い方</h2>
-        <p>送信機を通過位置に置いて「最新RSSI」を確認します。</p>
-        <p>次に、離れた位置に置いて「最新RSSI」を確認します。</p>
-        <p>近接と離れの差が大きいほど安定します。</p>
+                <p>
+                    通過位置でRX-0001とRX-0002の
+                    RSSIを確認します。
+                </p>
+
+                <p>
+                    2台の値が近いほど、
+                    左右バランスの確認がしやすくなります。
+                </p>
+
+                <p>
+                    送信機を離した位置でも確認し、
+                    ENTER / EXIT の設定調整に使用してください。
+                </p>
+            </div>
+
+        </div>
     </body>
     </html>
     """
 
     return html_text
+
 
 @app.get("/races", response_class=HTMLResponse)
 def races():
