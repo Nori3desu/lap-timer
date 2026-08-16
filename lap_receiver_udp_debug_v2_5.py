@@ -65,7 +65,14 @@ EXIT_CONFIRM_SECONDS = 1.0
 DEBUG_ENTRY = True
 
 DISPLAY_INTERVAL_SECONDS = 0.25
+
+# Web用RSSIログ
 RSSI_LOG_INTERVAL_SECONDS = 1.0
+
+# 通過検証時の高密度ログ
+RSSI_DENSE_LOG_INTERVAL_SECONDS = 0.20
+RSSI_DENSE_POST_EXIT_SECONDS = 4.0
+
 STATUS_INTERVAL_SECONDS = 10.0
 RSSI_MOVING_AVERAGE_SAMPLES = 3
 
@@ -170,6 +177,9 @@ class TransmitterState:
             for receiver_id in ACTIVE_RECEIVER_IDS
         }
     )
+
+    # EXIT成立後も一定時間、高密度RSSIログを継続する
+    dense_log_until_monotonic: float = 0.0
 
     waiting_for_clear_after_reset: bool = False
     entry_candidate_since: float | None = None
@@ -633,9 +643,32 @@ def update_receiver_state(
         )
     )
 
+    # --------------------------------------------------------
+    # 通過中だけRSSIログを高密度化する
+    #
+    # ・現在GateStateがWAIT以外
+    # ・今回のRSSIがENTER以上
+    # ・EXIT成立後4秒以内
+    #
+    # のどれかなら0.2秒間隔。
+    # 通常時は従来どおり1.0秒間隔。
+    # --------------------------------------------------------
+
+    dense_logging = (
+        state.gate_state != GateState.WAIT
+        or packet.rssi >= ENTRY_RSSI_THRESHOLD
+        or now_monotonic < state.dense_log_until_monotonic
+    )
+
+    log_interval = (
+        RSSI_DENSE_LOG_INTERVAL_SECONDS
+        if dense_logging
+        else RSSI_LOG_INTERVAL_SECONDS
+    )
+
     if (
         now_monotonic - last_log_monotonic
-        >= RSSI_LOG_INTERVAL_SECONDS
+        >= log_interval
     ):
         save_web_rssi_log(
             transmitter=transmitter,
@@ -810,6 +843,12 @@ def evaluate_gate(
 
         if now_monotonic - state.exit_candidate_since >= EXIT_CONFIRM_SECONDS:
             state.exit_candidate_since = None
+
+            state.dense_log_until_monotonic = (
+                now_monotonic
+                + RSSI_DENSE_POST_EXIT_SECONDS
+            )
+
             state.gate_state = GateState.WAIT
             print()
             print(f"[ダイバーシティゾーン離脱] {transmitter.serial_number}")
@@ -850,6 +889,8 @@ def process_lite_reset_request(
             receiver_id: 0.0
             for receiver_id in ACTIVE_RECEIVER_IDS
         }
+
+        state.dense_log_until_monotonic = 0.0
 
         state.waiting_for_clear_after_reset = True
         state.entry_candidate_since = None
