@@ -733,9 +733,19 @@ def update_receiver_state(
     # 通常時は従来どおり1.0秒間隔。
     # --------------------------------------------------------
 
+    # どちらか一方のRXがENTER以上を検出した時点で、
+    # この送信機全体を高密度ログモードにする。
+    #
+    # これによりRX1/RX2の保存密度を揃え、
+    # 通過検証時に両RXのRSSI推移を比較しやすくする。
+    if packet.rssi >= ENTRY_RSSI_THRESHOLD:
+        state.dense_log_until_monotonic = max(
+            state.dense_log_until_monotonic,
+            now_monotonic + RSSI_DENSE_POST_EXIT_SECONDS,
+        )
+
     dense_logging = (
         state.gate_state != GateState.WAIT
-        or packet.rssi >= ENTRY_RSSI_THRESHOLD
         or now_monotonic < state.dense_log_until_monotonic
     )
 
