@@ -2000,6 +2000,10 @@ def rssi_monitor():
                 <a class="action-link" href="/admin/rssi-analyze">
                     RSSI自動分析
                 </a>
+
+                <a class="action-link" href="/admin/rssi-pass-log">
+                    通過検証ログ
+                </a>
             </div>
     """
 
@@ -2279,6 +2283,729 @@ def rssi_monitor():
                 </p>
             </div>
 
+        </div>
+    </body>
+    </html>
+    """
+
+    return html_text
+
+
+
+# ============================================================
+# RSSI 通過検証ログ
+# ============================================================
+
+def get_rssi_pass_events(
+    minutes: int = 20,
+    max_events: int = 20,
+):
+    """
+    RSSIログから通過候補を抽出する。
+
+    ・ENTER以上になったログを通過候補としてクラスタ化
+    ・候補区間の前後4秒も解析対象に含める
+    ・RX-0001 / RX-0002 のピーク、件数、RSSI差を算出
+    ・同時間帯のラップ記録の有無も確認
+    """
+
+    settings = get_rssi_settings()
+
+    enter_threshold = settings[
+        "enter_rssi_threshold"
+    ]
+
+    db_path = os.path.join(
+        os.path.dirname(__file__),
+        "lap_timer.db",
+    )
+
+    since = time.time() - (minutes * 60)
+
+    conn = sqlite3.connect(
+        db_path,
+        timeout=5.0,
+    )
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            mac_address,
+            receiver_id,
+            name,
+            major,
+            rssi,
+            timestamp
+        FROM rssi_logs
+        WHERE receiver_id IN (
+            'RX-0001',
+            'RX-0002'
+        )
+          AND timestamp >= ?
+        ORDER BY
+            mac_address ASC,
+            timestamp ASC
+        """,
+        (since,),
+    )
+
+    log_rows = [
+        dict(row)
+        for row in cur.fetchall()
+    ]
+
+    cur.execute(
+        """
+        SELECT
+            name,
+            lap_number,
+            timestamp
+        FROM laps
+        WHERE timestamp >= ?
+        ORDER BY timestamp ASC
+        """,
+        (since,),
+    )
+
+    lap_rows = [
+        dict(row)
+        for row in cur.fetchall()
+    ]
+
+    conn.close()
+
+    logs_by_mac = {}
+
+    for row in log_rows:
+        mac = row["mac_address"]
+
+        logs_by_mac.setdefault(
+            mac,
+            [],
+        ).append(row)
+
+    events = []
+
+    # ENTER以上のサンプル同士が3秒以内なら
+    # 同じ1回の通過候補とみなす
+    cluster_gap_sec = 3.0
+
+    # 通過候補の前後を何秒残すか
+    context_sec = 4.0
+
+    for mac, rows in logs_by_mac.items():
+
+        high_rows = [
+            row
+            for row in rows
+            if row["rssi"] >= enter_threshold
+        ]
+
+        if not high_rows:
+            continue
+
+        clusters = []
+        current = []
+
+        for row in high_rows:
+
+            if not current:
+                current = [row]
+                continue
+
+            gap = (
+                row["timestamp"]
+                - current[-1]["timestamp"]
+            )
+
+            if gap <= cluster_gap_sec:
+                current.append(row)
+
+            else:
+                clusters.append(current)
+                current = [row]
+
+        if current:
+            clusters.append(current)
+
+        for cluster in clusters:
+
+            active_start = cluster[0]["timestamp"]
+            active_end = cluster[-1]["timestamp"]
+
+            window_start = (
+                active_start - context_sec
+            )
+            window_end = (
+                active_end + context_sec
+            )
+
+            samples = [
+                row
+                for row in rows
+                if (
+                    window_start
+                    <= row["timestamp"]
+                    <= window_end
+                )
+            ]
+
+            if not samples:
+                continue
+
+            rx1_samples = [
+                row
+                for row in samples
+                if row["receiver_id"] == "RX-0001"
+            ]
+
+            rx2_samples = [
+                row
+                for row in samples
+                if row["receiver_id"] == "RX-0002"
+            ]
+
+            rx1_peak = (
+                max(
+                    row["rssi"]
+                    for row in rx1_samples
+                )
+                if rx1_samples
+                else None
+            )
+
+            rx2_peak = (
+                max(
+                    row["rssi"]
+                    for row in rx2_samples
+                )
+                if rx2_samples
+                else None
+            )
+
+            peak_difference = None
+
+            if (
+                rx1_peak is not None
+                and rx2_peak is not None
+            ):
+                peak_difference = abs(
+                    rx1_peak - rx2_peak
+                )
+
+            strongest = max(
+                samples,
+                key=lambda row: row["rssi"],
+            )
+
+            peak_time = strongest["timestamp"]
+
+            name = (
+                strongest["name"]
+                or ""
+            )
+
+            # 同じ時間帯にラップ記録があるか確認
+            matched_laps = [
+                lap
+                for lap in lap_rows
+                if (
+                    lap["name"] == name
+                    and window_start
+                    <= lap["timestamp"]
+                    <= window_end
+                )
+            ]
+
+            # ------------------------------------------------
+            # 1秒単位でRX1/RX2の最大RSSIをまとめる
+            # ------------------------------------------------
+
+            bins = {}
+
+            for sample in samples:
+                second = int(
+                    sample["timestamp"]
+                )
+
+                if second not in bins:
+                    bins[second] = {
+                        "timestamp": second,
+                        "RX-0001": None,
+                        "RX-0002": None,
+                    }
+
+                receiver_id = sample[
+                    "receiver_id"
+                ]
+
+                old_rssi = bins[second].get(
+                    receiver_id
+                )
+
+                if (
+                    old_rssi is None
+                    or sample["rssi"] > old_rssi
+                ):
+                    bins[second][
+                        receiver_id
+                    ] = sample["rssi"]
+
+            timeline = []
+
+            for second in sorted(bins):
+                item = bins[second]
+
+                r1 = item["RX-0001"]
+                r2 = item["RX-0002"]
+
+                difference = None
+
+                if (
+                    r1 is not None
+                    and r2 is not None
+                ):
+                    difference = abs(
+                        r1 - r2
+                    )
+
+                timeline.append(
+                    {
+                        "timestamp":
+                            item["timestamp"],
+                        "rx1": r1,
+                        "rx2": r2,
+                        "difference":
+                            difference,
+                    }
+                )
+
+            events.append(
+                {
+                    "mac_address": mac,
+                    "name": name,
+                    "peak_time": peak_time,
+                    "window_start":
+                        window_start,
+                    "window_end":
+                        window_end,
+                    "rx1_peak": rx1_peak,
+                    "rx2_peak": rx2_peak,
+                    "peak_difference":
+                        peak_difference,
+                    "rx1_count":
+                        len(rx1_samples),
+                    "rx2_count":
+                        len(rx2_samples),
+                    "matched_laps":
+                        matched_laps,
+                    "timeline":
+                        timeline,
+                }
+            )
+
+    events.sort(
+        key=lambda event:
+            event["peak_time"],
+        reverse=True,
+    )
+
+    return events[:max_events]
+
+
+@app.get(
+    "/admin/rssi-pass-log",
+    response_class=HTMLResponse,
+)
+def rssi_pass_log():
+
+    events = get_rssi_pass_events(
+        minutes=20,
+        max_events=20,
+    )
+
+    html_text = """
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
+
+        <title>RSSI 通過検証ログ</title>
+
+        <style>
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                background: #f3f6fa;
+                color: #172033;
+                font-family:
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "Segoe UI",
+                    sans-serif;
+            }
+
+            .page {
+                width: 100%;
+                max-width: 760px;
+                margin: 0 auto;
+                padding: 16px 12px 32px;
+            }
+
+            a {
+                color: #325bd6;
+                text-decoration: none;
+            }
+
+            h1 {
+                margin: 18px 0 10px;
+                font-size: 28px;
+            }
+
+            .note {
+                background: white;
+                border-radius: 14px;
+                padding: 14px;
+                margin: 14px 0 18px;
+                color: #566174;
+                font-size: 13px;
+                line-height: 1.6;
+                box-shadow:
+                    0 3px 12px
+                    rgba(20, 35, 60, 0.07);
+            }
+
+            .event-card {
+                background: white;
+                border-radius: 16px;
+                padding: 15px;
+                margin-bottom: 16px;
+                box-shadow:
+                    0 4px 16px
+                    rgba(20, 35, 60, 0.09);
+            }
+
+            .event-top {
+                display: flex;
+                justify-content:
+                    space-between;
+                align-items: flex-start;
+                gap: 10px;
+            }
+
+            .event-time {
+                font-size: 20px;
+                font-weight: 800;
+            }
+
+            .event-name {
+                margin-top: 4px;
+                color: #667085;
+                font-size: 14px;
+            }
+
+            .lap-ok {
+                background: #dcf4e6;
+                color: #126a35;
+                padding: 7px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 700;
+                white-space: nowrap;
+            }
+
+            .lap-none {
+                background: #fff2c2;
+                color: #765900;
+                padding: 7px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 700;
+                white-space: nowrap;
+            }
+
+            .summary {
+                display: grid;
+                grid-template-columns:
+                    repeat(2, 1fr);
+                gap: 8px;
+                margin-top: 14px;
+            }
+
+            .summary-item {
+                background: #f7f9fc;
+                border-radius: 10px;
+                padding: 10px;
+                text-align: center;
+            }
+
+            .label {
+                color: #7a8494;
+                font-size: 11px;
+            }
+
+            .value {
+                margin-top: 3px;
+                font-size: 18px;
+                font-weight: 800;
+            }
+
+            details {
+                margin-top: 14px;
+            }
+
+            summary {
+                cursor: pointer;
+                color: #325bd6;
+                font-weight: 700;
+                padding: 8px 0;
+            }
+
+            .table-wrap {
+                overflow-x: auto;
+            }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 8px;
+                font-size: 13px;
+            }
+
+            th,
+            td {
+                padding: 8px 6px;
+                border-bottom:
+                    1px solid #e5e9ef;
+                text-align: center;
+                white-space: nowrap;
+            }
+
+            th {
+                color: #687386;
+                font-size: 11px;
+            }
+
+            .empty {
+                background: white;
+                border-radius: 14px;
+                padding: 24px;
+                text-align: center;
+                color: #667085;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="page">
+
+            <a href="/admin/rssi-monitor">
+                ← RSSIモニタへ戻る
+            </a>
+
+            <h1>通過検証ログ</h1>
+
+            <div class="note">
+                直近20分のRSSIログから、
+                ENTER以上になった区間を
+                「通過候補」として抽出しています。
+                候補区間の前後4秒も表示するため、
+                RSSIが強くなって再び弱くなる様子を
+                確認できます。
+            </div>
+    """
+
+    if not events:
+        html_text += """
+            <div class="empty">
+                通過候補はありません。
+            </div>
+        """
+
+    for index, event in enumerate(
+        events,
+        start=1,
+    ):
+        transmitter_name = (
+            transmitter_name_from_mac(
+                event["mac_address"]
+            )
+        )
+
+        time_text = time.strftime(
+            "%H:%M:%S",
+            time.localtime(
+                event["peak_time"]
+            ),
+        )
+
+        if event["matched_laps"]:
+            lap_badge = (
+                '<span class="lap-ok">'
+                '✓ 周回記録あり'
+                '</span>'
+            )
+        else:
+            lap_badge = (
+                '<span class="lap-none">'
+                '△ 周回記録なし'
+                '</span>'
+            )
+
+        rx1_peak = (
+            "-"
+            if event["rx1_peak"] is None
+            else str(event["rx1_peak"])
+        )
+
+        rx2_peak = (
+            "-"
+            if event["rx2_peak"] is None
+            else str(event["rx2_peak"])
+        )
+
+        peak_diff = (
+            "-"
+            if event["peak_difference"]
+            is None
+            else (
+                f'{event["peak_difference"]} dB'
+            )
+        )
+
+        html_text += f"""
+        <section class="event-card">
+
+            <div class="event-top">
+                <div>
+                    <div class="event-time">
+                        通過候補 #{index}
+                       　{time_text}
+                    </div>
+
+                    <div class="event-name">
+                        {html.escape(event["name"])}
+                        /
+                        {html.escape(transmitter_name)}
+                    </div>
+                </div>
+
+                {lap_badge}
+            </div>
+
+            <div class="summary">
+
+                <div class="summary-item">
+                    <div class="label">
+                        RX-0001 最大
+                    </div>
+                    <div class="value">
+                        {rx1_peak} dBm
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    <div class="label">
+                        RX-0002 最大
+                    </div>
+                    <div class="value">
+                        {rx2_peak} dBm
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    <div class="label">
+                        最大値差
+                    </div>
+                    <div class="value">
+                        {peak_diff}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    <div class="label">
+                        受信ログ数
+                    </div>
+                    <div class="value">
+                        {event["rx1_count"]}
+                        /
+                        {event["rx2_count"]}
+                    </div>
+                </div>
+
+            </div>
+
+            <details>
+                <summary>
+                    RSSI推移を見る
+                </summary>
+
+                <div class="table-wrap">
+                    <table>
+                        <tr>
+                            <th>時刻</th>
+                            <th>RX-0001</th>
+                            <th>RX-0002</th>
+                            <th>差</th>
+                        </tr>
+        """
+
+        for item in event["timeline"]:
+
+            row_time = time.strftime(
+                "%H:%M:%S",
+                time.localtime(
+                    item["timestamp"]
+                ),
+            )
+
+            rx1 = (
+                "-"
+                if item["rx1"] is None
+                else str(item["rx1"])
+            )
+
+            rx2 = (
+                "-"
+                if item["rx2"] is None
+                else str(item["rx2"])
+            )
+
+            diff = (
+                "-"
+                if item["difference"]
+                is None
+                else (
+                    f'{item["difference"]}'
+                )
+            )
+
+            html_text += f"""
+                        <tr>
+                            <td>{row_time}</td>
+                            <td>{rx1}</td>
+                            <td>{rx2}</td>
+                            <td>{diff}</td>
+                        </tr>
+            """
+
+        html_text += """
+                    </table>
+                </div>
+            </details>
+
+        </section>
+        """
+
+    html_text += """
         </div>
     </body>
     </html>
