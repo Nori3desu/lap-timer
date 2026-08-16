@@ -2301,12 +2301,15 @@ def get_rssi_pass_events(
     max_events: int = 20,
 ):
     """
-    RSSIログから通過候補を抽出する。
+    RSSIログから通過イベントを抽出する。
 
-    ・ENTER以上になったログを通過候補としてクラスタ化
-    ・候補区間の前後4秒も解析対象に含める
-    ・RX-0001 / RX-0002 のピーク、件数、RSSI差を算出
-    ・同時間帯のラップ記録の有無も確認
+    判定:
+    1. ENTER以上で通過開始
+    2. 通過中のRSSI推移を保持
+    3. ENTER到達後、RSSIがEXIT以下まで低下したら通過完了
+    4. EXITまで確認できない場合はEXIT未完了として残す
+
+    表示用に通過前後4秒のログも含める。
     """
 
     settings = get_rssi_settings()
@@ -2315,12 +2318,17 @@ def get_rssi_pass_events(
         "enter_rssi_threshold"
     ]
 
+    exit_threshold = settings[
+        "exit_rssi_threshold"
+    ]
+
     db_path = os.path.join(
         os.path.dirname(__file__),
         "lap_timer.db",
     )
 
     since = time.time() - (minutes * 60)
+    current_time = time.time()
 
     conn = sqlite3.connect(
         db_path,
@@ -2388,56 +2396,117 @@ def get_rssi_pass_events(
 
     events = []
 
-    # ENTER以上のサンプル同士が3秒以内なら
-    # 同じ1回の通過候補とみなす
-    cluster_gap_sec = 3.0
-
-    # 通過候補の前後を何秒残すか
+    # 通過前後の確認範囲
     context_sec = 4.0
+
+    # ENTER後、最低これだけ経過してから
+    # EXIT判定を有効にする
+    min_exit_delay_sec = 1.0
+
+    # EXIT未完了のイベントを無限に引き延ばさないための上限
+    max_event_sec = 30.0
 
     for mac, rows in logs_by_mac.items():
 
-        high_rows = [
-            row
-            for row in rows
-            if row["rssi"] >= enter_threshold
-        ]
-
-        if not high_rows:
+        if not rows:
             continue
 
-        clusters = []
-        current = []
+        inside = False
+        event_start = None
+        event_end = None
+        exit_completed = False
 
-        for row in high_rows:
+        raw_events = []
 
-            if not current:
-                current = [row]
+        for row in rows:
+            timestamp = row["timestamp"]
+            rssi = row["rssi"]
+
+            # --------------------------------------------
+            # 待機中 → ENTER
+            # --------------------------------------------
+            if not inside:
+
+                if rssi >= enter_threshold:
+                    inside = True
+                    event_start = timestamp
+                    event_end = timestamp
+                    exit_completed = False
+
                 continue
 
-            gap = (
-                row["timestamp"]
-                - current[-1]["timestamp"]
+            # --------------------------------------------
+            # 通過中
+            # --------------------------------------------
+            event_end = timestamp
+
+            elapsed = (
+                timestamp - event_start
             )
 
-            if gap <= cluster_gap_sec:
-                current.append(row)
+            # ENTER直後のノイズでEXIT扱いしない
+            if (
+                elapsed >= min_exit_delay_sec
+                and rssi <= exit_threshold
+            ):
+                raw_events.append(
+                    {
+                        "start": event_start,
+                        "end": timestamp,
+                        "exit_completed": True,
+                    }
+                )
 
-            else:
-                clusters.append(current)
-                current = [row]
+                inside = False
+                event_start = None
+                event_end = None
+                exit_completed = True
+                continue
 
-        if current:
-            clusters.append(current)
+            # 30秒以上EXITできなければ、
+            # 「EXIT未完了」として一度確定
+            if elapsed >= max_event_sec:
+                raw_events.append(
+                    {
+                        "start": event_start,
+                        "end": timestamp,
+                        "exit_completed": False,
+                    }
+                )
 
-        for cluster in clusters:
+                inside = False
+                event_start = None
+                event_end = None
+                exit_completed = False
 
-            active_start = cluster[0]["timestamp"]
-            active_end = cluster[-1]["timestamp"]
+        # ログの最後までENTER状態が続いていた場合
+        if inside and event_start is not None:
+
+            raw_events.append(
+                {
+                    "start": event_start,
+                    "end": (
+                        event_end
+                        if event_end is not None
+                        else current_time
+                    ),
+                    "exit_completed": False,
+                }
+            )
+
+        # ====================================================
+        # 各イベントを詳細解析
+        # ====================================================
+
+        for raw_event in raw_events:
+
+            active_start = raw_event["start"]
+            active_end = raw_event["end"]
 
             window_start = (
                 active_start - context_sec
             )
+
             window_end = (
                 active_end + context_sec
             )
@@ -2458,13 +2527,15 @@ def get_rssi_pass_events(
             rx1_samples = [
                 row
                 for row in samples
-                if row["receiver_id"] == "RX-0001"
+                if row["receiver_id"]
+                == "RX-0001"
             ]
 
             rx2_samples = [
                 row
                 for row in samples
-                if row["receiver_id"] == "RX-0002"
+                if row["receiver_id"]
+                == "RX-0002"
             ]
 
             rx1_peak = (
@@ -2507,7 +2578,6 @@ def get_rssi_pass_events(
                 or ""
             )
 
-            # 同じ時間帯にラップ記録があるか確認
             matched_laps = [
                 lap
                 for lap in lap_rows
@@ -2519,13 +2589,14 @@ def get_rssi_pass_events(
                 )
             ]
 
-            # ------------------------------------------------
+            # --------------------------------------------
             # 1秒単位でRX1/RX2の最大RSSIをまとめる
-            # ------------------------------------------------
+            # --------------------------------------------
 
             bins = {}
 
             for sample in samples:
+
                 second = int(
                     sample["timestamp"]
                 )
@@ -2556,6 +2627,7 @@ def get_rssi_pass_events(
             timeline = []
 
             for second in sorted(bins):
+
                 item = bins[second]
 
                 r1 = item["RX-0001"]
@@ -2571,6 +2643,20 @@ def get_rssi_pass_events(
                         r1 - r2
                     )
 
+                phase = ""
+
+                if second < int(active_start):
+                    phase = "接近前"
+
+                elif second > int(active_end):
+                    phase = "通過後"
+
+                elif raw_event["exit_completed"]:
+                    phase = "通過中"
+
+                else:
+                    phase = "EXIT待ち"
+
                 timeline.append(
                     {
                         "timestamp":
@@ -2579,28 +2665,62 @@ def get_rssi_pass_events(
                         "rx2": r2,
                         "difference":
                             difference,
+                        "phase":
+                            phase,
                     }
                 )
+
+            duration = max(
+                0.0,
+                active_end - active_start,
+            )
 
             events.append(
                 {
                     "mac_address": mac,
                     "name": name,
-                    "peak_time": peak_time,
+
+                    "peak_time":
+                        peak_time,
+
+                    "active_start":
+                        active_start,
+
+                    "active_end":
+                        active_end,
+
+                    "duration":
+                        duration,
+
+                    "exit_completed":
+                        raw_event[
+                            "exit_completed"
+                        ],
+
                     "window_start":
                         window_start,
+
                     "window_end":
                         window_end,
-                    "rx1_peak": rx1_peak,
-                    "rx2_peak": rx2_peak,
+
+                    "rx1_peak":
+                        rx1_peak,
+
+                    "rx2_peak":
+                        rx2_peak,
+
                     "peak_difference":
                         peak_difference,
+
                     "rx1_count":
                         len(rx1_samples),
+
                     "rx2_count":
                         len(rx2_samples),
+
                     "matched_laps":
                         matched_laps,
+
                     "timeline":
                         timeline,
                 }
@@ -2720,6 +2840,33 @@ def rssi_pass_log():
                 font-size: 12px;
                 font-weight: 700;
                 white-space: nowrap;
+            }
+
+            .exit-ok {
+                background: #dcf4e6;
+                color: #126a35;
+                padding: 7px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 700;
+                white-space: nowrap;
+            }
+
+            .exit-ng {
+                background: #fde2e5;
+                color: #982938;
+                padding: 7px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 800;
+                white-space: nowrap;
+            }
+
+            .badge-row {
+                display: flex;
+                flex-direction: column;
+                align-items: flex-end;
+                gap: 6px;
             }
 
             .lap-none {
@@ -2860,6 +3007,23 @@ def rssi_pass_log():
                 '</span>'
             )
 
+        if event["exit_completed"]:
+            exit_badge = (
+                '<span class="exit-ok">'
+                '✓ EXIT完了'
+                '</span>'
+            )
+        else:
+            exit_badge = (
+                '<span class="exit-ng">'
+                '⚠ EXIT未完了'
+                '</span>'
+            )
+
+        duration_text = (
+            f'{event["duration"]:.1f} 秒'
+        )
+
         rx1_peak = (
             "-"
             if event["rx1_peak"] is None
@@ -2898,7 +3062,10 @@ def rssi_pass_log():
                     </div>
                 </div>
 
-                {lap_badge}
+                <div class="badge-row">
+                    {lap_badge}
+                    {exit_badge}
+                </div>
             </div>
 
             <div class="summary">
@@ -2941,6 +3108,15 @@ def rssi_pass_log():
                     </div>
                 </div>
 
+                <div class="summary-item">
+                    <div class="label">
+                        ENTER → EXIT
+                    </div>
+                    <div class="value">
+                        {duration_text}
+                    </div>
+                </div>
+
             </div>
 
             <details>
@@ -2955,6 +3131,7 @@ def rssi_pass_log():
                             <th>RX-0001</th>
                             <th>RX-0002</th>
                             <th>差</th>
+                            <th>状態</th>
                         </tr>
         """
 
@@ -2994,6 +3171,7 @@ def rssi_pass_log():
                             <td>{rx1}</td>
                             <td>{rx2}</td>
                             <td>{diff}</td>
+                            <td>{item["phase"]}</td>
                         </tr>
             """
 
