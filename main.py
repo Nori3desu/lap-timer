@@ -2418,9 +2418,18 @@ def get_rssi_pass_events(
 
         raw_events = []
 
+        last_rssi_by_receiver = {
+            "RX-0001": None,
+            "RX-0002": None,
+        }
+
         for row in rows:
             timestamp = row["timestamp"]
             rssi = row["rssi"]
+
+            last_rssi_by_receiver[
+                row["receiver_id"]
+            ] = rssi
 
             # --------------------------------------------
             # 待機中 → ENTER
@@ -2457,6 +2466,14 @@ def get_rssi_pass_events(
                         "exit_timestamp": timestamp,
                         "exit_receiver_id": row["receiver_id"],
                         "exit_rssi": rssi,
+                        "exit_rx1_rssi":
+                            last_rssi_by_receiver[
+                                "RX-0001"
+                            ],
+                        "exit_rx2_rssi":
+                            last_rssi_by_receiver[
+                                "RX-0002"
+                            ],
                     }
                 )
 
@@ -2477,6 +2494,8 @@ def get_rssi_pass_events(
                         "exit_timestamp": None,
                         "exit_receiver_id": None,
                         "exit_rssi": None,
+                        "exit_rx1_rssi": None,
+                        "exit_rx2_rssi": None,
                     }
                 )
 
@@ -2719,6 +2738,16 @@ def get_rssi_pass_events(
                     "exit_rssi":
                         raw_event.get(
                             "exit_rssi"
+                        ),
+
+                    "exit_rx1_rssi":
+                        raw_event.get(
+                            "exit_rx1_rssi"
+                        ),
+
+                    "exit_rx2_rssi":
+                        raw_event.get(
+                            "exit_rx2_rssi"
                         ),
 
                     "window_start":
@@ -3056,10 +3085,23 @@ def rssi_pass_log():
                 ),
             )
 
+            exit_rx1_text = (
+                "-"
+                if event["exit_rx1_rssi"] is None
+                else f'{event["exit_rx1_rssi"]} dBm'
+            )
+
+            exit_rx2_text = (
+                "-"
+                if event["exit_rx2_rssi"] is None
+                else f'{event["exit_rx2_rssi"]} dBm'
+            )
+
             exit_detail_text = (
-                f'{exit_time_text} / '
-                f'{event["exit_receiver_id"]} / '
-                f'{event["exit_rssi"]} dBm'
+                f'{exit_time_text}<br>'
+                f'成立RX: {event["exit_receiver_id"]}<br>'
+                f'RX-0001: {exit_rx1_text}<br>'
+                f'RX-0002: {exit_rx2_text}'
             )
         else:
             exit_detail_text = "未成立"
