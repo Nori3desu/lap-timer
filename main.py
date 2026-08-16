@@ -2776,6 +2776,9 @@ def get_rssi_pass_events(
 
                     "timeline":
                         timeline,
+
+                    "raw_samples":
+                        samples,
                 }
             )
 
@@ -3263,6 +3266,68 @@ def rssi_pass_log():
                             <td>{rx2}</td>
                             <td>{diff}</td>
                             <td>{item["phase"]}</td>
+                        </tr>
+            """
+
+        html_text += """
+                    </table>
+                </div>
+            </details>
+
+            <details>
+                <summary>
+                    高密度RSSI生ログを見る
+                </summary>
+
+                <div class="table-wrap">
+                    <table>
+                        <tr>
+                            <th>時刻</th>
+                            <th>受信機</th>
+                            <th>RSSI</th>
+                            <th>状態</th>
+                        </tr>
+        """
+
+        for sample in event["raw_samples"]:
+
+            sample_time = time.strftime(
+                "%H:%M:%S",
+                time.localtime(
+                    sample["timestamp"]
+                ),
+            )
+
+            milliseconds = int(
+                (
+                    sample["timestamp"]
+                    - int(sample["timestamp"])
+                )
+                * 1000
+            )
+
+            sample_time_text = (
+                f"{sample_time}.{milliseconds:03d}"
+            )
+
+            if sample["timestamp"] < event["active_start"]:
+                sample_phase = "接近前"
+
+            elif sample["timestamp"] > event["active_end"]:
+                sample_phase = "通過後"
+
+            elif event["exit_completed"]:
+                sample_phase = "通過中"
+
+            else:
+                sample_phase = "EXIT待ち"
+
+            html_text += f"""
+                        <tr>
+                            <td>{sample_time_text}</td>
+                            <td>{html.escape(sample["receiver_id"])}</td>
+                            <td>{sample["rssi"]} dBm</td>
+                            <td>{sample_phase}</td>
                         </tr>
             """
 
