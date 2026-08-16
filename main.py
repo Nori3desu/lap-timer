@@ -2454,6 +2454,9 @@ def get_rssi_pass_events(
                         "start": event_start,
                         "end": timestamp,
                         "exit_completed": True,
+                        "exit_timestamp": timestamp,
+                        "exit_receiver_id": row["receiver_id"],
+                        "exit_rssi": rssi,
                     }
                 )
 
@@ -2471,6 +2474,9 @@ def get_rssi_pass_events(
                         "start": event_start,
                         "end": timestamp,
                         "exit_completed": False,
+                        "exit_timestamp": None,
+                        "exit_receiver_id": None,
+                        "exit_rssi": None,
                     }
                 )
 
@@ -2491,6 +2497,9 @@ def get_rssi_pass_events(
                         else current_time
                     ),
                     "exit_completed": False,
+                    "exit_timestamp": None,
+                    "exit_receiver_id": None,
+                    "exit_rssi": None,
                 }
             )
 
@@ -2696,6 +2705,21 @@ def get_rssi_pass_events(
                         raw_event[
                             "exit_completed"
                         ],
+
+                    "exit_timestamp":
+                        raw_event.get(
+                            "exit_timestamp"
+                        ),
+
+                    "exit_receiver_id":
+                        raw_event.get(
+                            "exit_receiver_id"
+                        ),
+
+                    "exit_rssi":
+                        raw_event.get(
+                            "exit_rssi"
+                        ),
 
                     "window_start":
                         window_start,
@@ -3024,6 +3048,22 @@ def rssi_pass_log():
             f'{event["duration"]:.1f} 秒'
         )
 
+        if event["exit_completed"] and event["exit_timestamp"] is not None:
+            exit_time_text = time.strftime(
+                "%H:%M:%S",
+                time.localtime(
+                    event["exit_timestamp"]
+                ),
+            )
+
+            exit_detail_text = (
+                f'{exit_time_text} / '
+                f'{event["exit_receiver_id"]} / '
+                f'{event["exit_rssi"]} dBm'
+            )
+        else:
+            exit_detail_text = "未成立"
+
         rx1_peak = (
             "-"
             if event["rx1_peak"] is None
@@ -3114,6 +3154,15 @@ def rssi_pass_log():
                     </div>
                     <div class="value">
                         {duration_text}
+                    </div>
+                </div>
+
+                <div class="summary-item">
+                    <div class="label">
+                        EXIT成立
+                    </div>
+                    <div class="value" style="font-size:14px;">
+                        {exit_detail_text}
                     </div>
                 </div>
 
