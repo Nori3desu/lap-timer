@@ -2423,24 +2423,97 @@ def get_rssi_pass_events(
             "RX-0002": None,
         }
 
+        last_time_by_receiver = {
+            "RX-0001": None,
+            "RX-0002": None,
+        }
+
+        exit_candidate_since = None
+
         for row in rows:
             timestamp = row["timestamp"]
             rssi = row["rssi"]
+            receiver_id = row["receiver_id"]
 
             last_rssi_by_receiver[
-                row["receiver_id"]
+                receiver_id
             ] = rssi
+
+            last_time_by_receiver[
+                receiver_id
+            ] = timestamp
+
+            rx1_rssi = last_rssi_by_receiver[
+                "RX-0001"
+            ]
+            rx2_rssi = last_rssi_by_receiver[
+                "RX-0002"
+            ]
+
+            rx1_time = last_time_by_receiver[
+                "RX-0001"
+            ]
+            rx2_time = last_time_by_receiver[
+                "RX-0002"
+            ]
+
+            # 本番プログラムと同じ考え方で、
+            # 両RXのデータが新鮮か確認する
+            both_fresh = (
+                rx1_time is not None
+                and rx2_time is not None
+                and timestamp - rx1_time <= 0.60
+                and timestamp - rx2_time <= 0.60
+            )
+
+            fresh_values = []
+
+            if (
+                rx1_time is not None
+                and timestamp - rx1_time <= 0.60
+                and rx1_rssi is not None
+            ):
+                fresh_values.append(rx1_rssi)
+
+            if (
+                rx2_time is not None
+                and timestamp - rx2_time <= 0.60
+                and rx2_rssi is not None
+            ):
+                fresh_values.append(rx2_rssi)
+
+            combined_rssi = (
+                max(fresh_values)
+                if fresh_values
+                else None
+            )
+
+            entry_signal = (
+                combined_rssi is not None
+                and combined_rssi >= enter_threshold
+            )
+
+            # 本番と同じく、
+            # RX1/RX2の両方がEXIT未満であることを要求
+            both_below_exit = (
+                both_fresh
+                and rx1_rssi is not None
+                and rx2_rssi is not None
+                and rx1_rssi < exit_threshold
+                and rx2_rssi < exit_threshold
+            )
 
             # --------------------------------------------
             # 待機中 → ENTER
             # --------------------------------------------
             if not inside:
 
-                if rssi >= enter_threshold:
+                if entry_signal:
                     inside = True
                     event_start = timestamp
                     event_end = timestamp
                     exit_completed = False
+                    exit_candidate_since = None
 
                 continue
 
@@ -2453,35 +2526,53 @@ def get_rssi_pass_events(
                 timestamp - event_start
             )
 
-            # ENTER直後のノイズでEXIT扱いしない
+            # --------------------------------------------
+            # EXIT候補
+            #
+            # 本番と同様に
+            # 「両RXがEXIT未満」の状態が
+            # 1.0秒継続したらEXIT成立
+            # --------------------------------------------
             if (
                 elapsed >= min_exit_delay_sec
-                and rssi <= exit_threshold
+                and both_below_exit
             ):
-                raw_events.append(
-                    {
-                        "start": event_start,
-                        "end": timestamp,
-                        "exit_completed": True,
-                        "exit_timestamp": timestamp,
-                        "exit_receiver_id": row["receiver_id"],
-                        "exit_rssi": rssi,
-                        "exit_rx1_rssi":
-                            last_rssi_by_receiver[
-                                "RX-0001"
-                            ],
-                        "exit_rx2_rssi":
-                            last_rssi_by_receiver[
-                                "RX-0002"
-                            ],
-                    }
+                if exit_candidate_since is None:
+                    exit_candidate_since = timestamp
+
+                exit_elapsed = (
+                    timestamp
+                    - exit_candidate_since
                 )
 
-                inside = False
-                event_start = None
-                event_end = None
-                exit_completed = True
-                continue
+                if exit_elapsed >= 1.0:
+                    raw_events.append(
+                        {
+                            "start": event_start,
+                            "end": timestamp,
+                            "exit_completed": True,
+                            "exit_timestamp": timestamp,
+                            "exit_receiver_id":
+                                "RX-0001+RX-0002",
+                            "exit_rssi": None,
+                            "exit_rx1_rssi":
+                                rx1_rssi,
+                            "exit_rx2_rssi":
+                                rx2_rssi,
+                        }
+                    )
+
+                    inside = False
+                    event_start = None
+                    event_end = None
+                    exit_completed = True
+                    exit_candidate_since = None
+                    continue
+
+            else:
+                # 両RXがEXIT未満でなくなったら
+                # EXIT候補をキャンセル
+                exit_candidate_since = None
 
             # 30秒以上EXITできなければ、
             # 「EXIT未完了」として一度確定
@@ -2503,6 +2594,7 @@ def get_rssi_pass_events(
                 event_start = None
                 event_end = None
                 exit_completed = False
+                exit_candidate_since = None
 
         # ログの最後までENTER状態が続いていた場合
         if inside and event_start is not None:
