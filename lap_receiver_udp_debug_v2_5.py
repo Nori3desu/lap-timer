@@ -821,12 +821,72 @@ def evaluate_gate(
         )
         state.last_display_monotonic = now_monotonic
 
-    both_below_exit = (
-        both_receivers_fresh
-        and rx1_avg is not None
-        and rx2_avg is not None
+    rx1_state = state.receiver_states["RX-0001"]
+    rx2_state = state.receiver_states["RX-0002"]
+
+    rx1_has_data = (
+        rx1_state.rssi is not None
+        and rx1_state.last_packet_monotonic > 0.0
+    )
+
+    rx2_has_data = (
+        rx2_state.rssi is not None
+        and rx2_state.last_packet_monotonic > 0.0
+    )
+
+    rx1_age = (
+        now_monotonic - rx1_state.last_packet_monotonic
+        if rx1_has_data
+        else None
+    )
+
+    rx2_age = (
+        now_monotonic - rx2_state.last_packet_monotonic
+        if rx2_has_data
+        else None
+    )
+
+    rx1_timed_out = (
+        rx1_has_data
+        and rx1_age is not None
+        and rx1_age > RECEIVER_DATA_TIMEOUT_SECONDS
+    )
+
+    rx2_timed_out = (
+        rx2_has_data
+        and rx2_age is not None
+        and rx2_age > RECEIVER_DATA_TIMEOUT_SECONDS
+    )
+
+    rx1_below_exit = (
+        rx1_avg is not None
         and rx1_avg < EXIT_RSSI_THRESHOLD
+    )
+
+    rx2_below_exit = (
+        rx2_avg is not None
         and rx2_avg < EXIT_RSSI_THRESHOLD
+    )
+
+    rx1_exit_ready = (
+        rx1_has_data
+        and (
+            rx1_below_exit
+            or rx1_timed_out
+        )
+    )
+
+    rx2_exit_ready = (
+        rx2_has_data
+        and (
+            rx2_below_exit
+            or rx2_timed_out
+        )
+    )
+
+    both_below_exit = (
+        rx1_exit_ready
+        and rx2_exit_ready
     )
 
     if state.waiting_for_clear_after_reset:
