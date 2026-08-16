@@ -57,6 +57,9 @@ ENTRY_RSSI_THRESHOLD = -60
 EXIT_RSSI_THRESHOLD = -68
 MINIMUM_LAP_SECONDS = 10.0
 
+# 上記はフォールバック用デフォルト値。
+# 起動時に lap_timer.db の settings から読み込んで上書きする。
+
 RECEIVER_DATA_TIMEOUT_SECONDS = 0.60
 
 ENTRY_CONFIRM_SECONDS = 0.12
@@ -204,6 +207,82 @@ invalid_packet_count = 0
 unknown_transmitter_count = 0
 inactive_receiver_count = 0
 last_status_monotonic = 0.0
+
+
+# ============================================================
+# Web設定読み込み
+# ============================================================
+
+def load_web_rssi_settings() -> None:
+    global ENTRY_RSSI_THRESHOLD
+    global EXIT_RSSI_THRESHOLD
+    global MINIMUM_LAP_SECONDS
+
+    connection = None
+
+    try:
+        connection = sqlite3.connect(
+            WEB_DATABASE_PATH,
+            timeout=5.0,
+        )
+
+        rows = connection.execute(
+            """
+            SELECT key, value
+            FROM settings
+            WHERE key IN (
+                'enter_rssi_threshold',
+                'exit_rssi_threshold',
+                'min_lap_time_sec'
+            )
+            """
+        ).fetchall()
+
+        settings = {
+            key: value
+            for key, value in rows
+        }
+
+        ENTRY_RSSI_THRESHOLD = int(
+            settings.get(
+                "enter_rssi_threshold",
+                ENTRY_RSSI_THRESHOLD,
+            )
+        )
+
+        EXIT_RSSI_THRESHOLD = int(
+            settings.get(
+                "exit_rssi_threshold",
+                EXIT_RSSI_THRESHOLD,
+            )
+        )
+
+        MINIMUM_LAP_SECONDS = float(
+            settings.get(
+                "min_lap_time_sec",
+                MINIMUM_LAP_SECONDS,
+            )
+        )
+
+        print()
+        print("============================================")
+        print(" Web RSSI設定を読み込みました")
+        print(f" ENTER   : {ENTRY_RSSI_THRESHOLD} dBm")
+        print(f" EXIT    : {EXIT_RSSI_THRESHOLD} dBm")
+        print(f" MIN LAP : {MINIMUM_LAP_SECONDS:.1f} 秒")
+        print("============================================")
+        print()
+
+    except (sqlite3.Error, ValueError, TypeError) as error:
+        print()
+        print(
+            "[Web RSSI設定読込エラー] "
+            f"デフォルト値を使用します: {error}"
+        )
+
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 # ============================================================
@@ -1322,6 +1401,8 @@ def request_shutdown() -> None:
 
 async def main() -> None:
     global last_status_monotonic
+
+    load_web_rssi_settings()
 
     connection = open_database()
 
