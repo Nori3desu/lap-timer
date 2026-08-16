@@ -2493,14 +2493,68 @@ def get_rssi_pass_events(
                 and combined_rssi >= enter_threshold
             )
 
-            # 本番と同じく、
-            # RX1/RX2の両方がEXIT未満であることを要求
-            both_below_exit = (
-                both_fresh
+            # ------------------------------------------------
+            # 本番受信プログラムと同じEXIT判定
+            #
+            # RXごとに
+            # ・RSSIがEXIT閾値未満
+            #       または
+            # ・最後の受信から0.60秒超
+            #
+            # のどちらかならEXIT側とみなす。
+            #
+            # 一度も受信していないRXはEXIT扱いしない。
+            # ------------------------------------------------
+
+            rx1_has_data = (
+                rx1_time is not None
                 and rx1_rssi is not None
+            )
+
+            rx2_has_data = (
+                rx2_time is not None
                 and rx2_rssi is not None
+            )
+
+            rx1_timed_out = (
+                rx1_has_data
+                and timestamp - rx1_time > 0.60
+            )
+
+            rx2_timed_out = (
+                rx2_has_data
+                and timestamp - rx2_time > 0.60
+            )
+
+            rx1_below_exit = (
+                rx1_has_data
                 and rx1_rssi < exit_threshold
+            )
+
+            rx2_below_exit = (
+                rx2_has_data
                 and rx2_rssi < exit_threshold
+            )
+
+            rx1_exit_ready = (
+                rx1_has_data
+                and (
+                    rx1_below_exit
+                    or rx1_timed_out
+                )
+            )
+
+            rx2_exit_ready = (
+                rx2_has_data
+                and (
+                    rx2_below_exit
+                    or rx2_timed_out
+                )
+            )
+
+            both_below_exit = (
+                rx1_exit_ready
+                and rx2_exit_ready
             )
 
             # --------------------------------------------
@@ -2530,8 +2584,8 @@ def get_rssi_pass_events(
             # EXIT候補
             #
             # 本番と同様に
-            # 「両RXがEXIT未満」の状態が
-            # 1.0秒継続したらEXIT成立
+            # 両RXが「弱RSSIまたは受信タイムアウト」
+            # の状態を1.0秒継続したらEXIT成立
             # --------------------------------------------
             if (
                 elapsed >= min_exit_delay_sec
@@ -2570,7 +2624,7 @@ def get_rssi_pass_events(
                     continue
 
             else:
-                # 両RXがEXIT未満でなくなったら
+                # 両RXがEXIT側でなくなったら
                 # EXIT候補をキャンセル
                 exit_candidate_since = None
 
