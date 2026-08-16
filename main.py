@@ -1491,16 +1491,28 @@ def analyze_rssi_logs():
 
 @app.get("/admin/rssi-monitor", response_class=HTMLResponse)
 def rssi_monitor():
-    logs = get_latest_rssi_logs(100)
+    logs = get_latest_rssi_logs(200)
     settings = get_rssi_settings()
 
+    now = time.time()
+    health_window_sec = 30
+
     stats = {}
+    recent_counts = {}
 
     for log in logs:
         mac = log["mac_address"]
         receiver_id = log.get("receiver_id") or "RX-UNKNOWN"
 
         key = (mac, receiver_id)
+
+        log_created_at = log.get(
+            "created_at",
+            log.get("timestamp", 0),
+        )
+
+        if now - log_created_at <= health_window_sec:
+            recent_counts[key] = recent_counts.get(key, 0) + 1
 
         if key not in stats:
             stats[key] = {
@@ -1529,11 +1541,6 @@ def rssi_monitor():
         )
         stats[key]["count"] += 1
         stats[key]["sum"] += log["rssi"]
-
-        log_created_at = log.get(
-            "created_at",
-            log.get("timestamp", 0),
-        )
 
         if log_created_at > stats[key]["created_at"]:
             stats[key]["created_at"] = log_created_at
@@ -1810,6 +1817,50 @@ def rssi_monitor():
                 white-space: nowrap;
             }}
 
+            .health-ok {{
+                margin: 0 0 14px;
+                padding: 11px 13px;
+                border-radius: 12px;
+                background: #e4f6ea;
+                color: #176b36;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            .health-warning {{
+                margin: 0 0 14px;
+                padding: 12px 13px;
+                border-radius: 12px;
+                background: #fff2c2;
+                color: #765900;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+
+            .health-danger {{
+                margin: 0 0 14px;
+                padding: 12px 13px;
+                border-radius: 12px;
+                background: #fde2e5;
+                color: #982938;
+                font-size: 14px;
+                font-weight: 800;
+            }}
+
+            .health-detail {{
+                margin-top: 4px;
+                font-size: 12px;
+                font-weight: 600;
+                opacity: 0.85;
+            }}
+
+            .packet-count {{
+                margin-top: 8px;
+                color: #667085;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+
             .balance-card {{
                 margin-top: 14px;
                 background: #fff7d8;
@@ -1969,6 +2020,75 @@ def rssi_monitor():
 
             rx_values = []
 
+            receiver_health = {}
+
+            for receiver in receivers:
+                receiver_id = receiver["receiver_id"]
+                key = (mac, receiver_id)
+
+                count_30s = recent_counts.get(key, 0)
+                age_sec = int(now - receiver["created_at"])
+
+                receiver_health[receiver_id] = {
+                    "count": count_30s,
+                    "age": age_sec,
+                }
+
+            health_class = "health-ok"
+            health_title = "✓ 受信状態 正常"
+            health_detail = "RX-0001 / RX-0002 とも受信しています"
+
+            rx1_health = receiver_health.get("RX-0001")
+            rx2_health = receiver_health.get("RX-0002")
+
+            if rx1_health and rx2_health:
+                c1 = rx1_health["count"]
+                c2 = rx2_health["count"]
+                a1 = rx1_health["age"]
+                a2 = rx2_health["age"]
+
+                max_count = max(c1, c2)
+                min_count = min(c1, c2)
+
+                weak_rx = "RX-0001" if c1 < c2 else "RX-0002"
+
+                ratio = (
+                    min_count / max_count
+                    if max_count > 0
+                    else 1.0
+                )
+
+                if (
+                    (a1 > 10 and a2 <= 3)
+                    or (a2 > 10 and a1 <= 3)
+                ):
+                    health_class = "health-danger"
+                    health_title = f"⚠ {weak_rx} 受信停止の可能性"
+                    health_detail = "レシーバーの再起動を確認してください"
+
+                elif max_count >= 8 and ratio < 0.10:
+                    health_class = "health-danger"
+                    health_title = f"⚠ {weak_rx} 受信異常の可能性"
+                    health_detail = (
+                        f"直近30秒: RX-0001 {c1}件 / "
+                        f"RX-0002 {c2}件　"
+                        "再起動を確認してください"
+                    )
+
+                elif max_count >= 8 and ratio < 0.30:
+                    health_class = "health-warning"
+                    health_title = f"△ {weak_rx} 受信頻度が低下"
+                    health_detail = (
+                        f"直近30秒: RX-0001 {c1}件 / "
+                        f"RX-0002 {c2}件"
+                    )
+
+                else:
+                    health_detail = (
+                        f"直近30秒: RX-0001 {c1}件 / "
+                        f"RX-0002 {c2}件"
+                    )
+
             html_text += f"""
             <section class="device-card">
 
@@ -1981,6 +2101,13 @@ def rssi_monitor():
                         <div class="tx-name">
                             {html.escape(transmitter_name)}
                         </div>
+                    </div>
+                </div>
+
+                <div class="{health_class}">
+                    {health_title}
+                    <div class="health-detail">
+                        {health_detail}
                     </div>
                 </div>
 
@@ -2047,6 +2174,11 @@ def rssi_monitor():
                             <div class="judge">
                                 {judge}
                             </div>
+                        </div>
+
+                        <div class="packet-count">
+                            直近30秒の受信ログ:
+                            {recent_counts.get((mac, receiver_id), 0)}件
                         </div>
 
                         <div class="meta-grid">
