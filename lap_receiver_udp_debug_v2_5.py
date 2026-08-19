@@ -963,10 +963,22 @@ def evaluate_gate(
             state.entry_candidate_since = now_monotonic
             if DEBUG_ENTRY:
                 print()
+                fresh_text = " ".join(
+                    f"{receiver_id}={rssi}"
+                    for receiver_id, rssi
+                    in sorted(
+                        fresh_rssi_by_receiver.items()
+                    )
+                )
+
+                if not fresh_text:
+                    fresh_text = "RXなし"
+
                 print(
-                    f"[ダイバーシティENTRY開始] {transmitter.serial_number} "
-                    f"RX1平均={rx1_avg} RX2平均={rx2_avg} "
-                    f"差={rssi_difference} dB"
+                    f"[N-RX ENTRY開始] {transmitter.serial_number} "
+                    f"{fresh_text} "
+                    f"有効RX={len(fresh_values)} "
+                    f"差={rssi_difference}"
                 )
         return
 
