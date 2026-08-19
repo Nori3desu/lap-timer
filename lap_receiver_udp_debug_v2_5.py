@@ -622,7 +622,7 @@ def record_lap(
     state: TransmitterState,
     packet: UdpPacket,
     combined_rssi: int,
-    rssi_difference: int,
+    rssi_difference: int | None,
 ) -> None:
     now_monotonic = time.monotonic()
 
@@ -669,15 +669,16 @@ def record_lap(
             f"{transmitter.serial_number}: {error}"
         )
 
-    rx1_rssi = state.receiver_states["RX-0001"].rssi
-    rx2_rssi = state.receiver_states["RX-0002"].rssi
+    active_receiver_text = ", ".join(
+        sorted(ACTIVE_RECEIVER_IDS)
+    )
 
     print()
     print()
     print("============================================")
-    print("       UDP 2台統合ラップ検出")
+    print("       UDP N-RX 統合ラップ検出")
     print("============================================")
-    print("受信機     : RX-0001 + RX-0002")
+    print(f"設定RX     : {active_receiver_text}")
     print(f"送信機     : {transmitter.serial_number}")
     print(f"UDP TX-ID  : {packet.udp_transmitter_id}")
     print(f"MAC        : {packet.mac_address}")
@@ -694,10 +695,24 @@ def record_lap(
     else:
         print(f"ラップタイム: {lap_time_seconds:.3f} 秒")
 
-    print(f"RX-0001    : {rx1_rssi} dBm")
-    print(f"RX-0002    : {rx2_rssi} dBm")
+    for receiver_id in sorted(ACTIVE_RECEIVER_IDS):
+        receiver_state = state.receiver_states[
+            receiver_id
+        ]
+
+        receiver_rssi = receiver_state.rssi
+
+        print(
+            f"{receiver_id:<11}: "
+            f"{receiver_rssi} dBm"
+        )
+
     print(f"統合RSSI   : {combined_rssi} dBm")
-    print(f"RSSI差     : {rssi_difference} dB")
+
+    if rssi_difference is None:
+        print("RSSI差     : -")
+    else:
+        print(f"RSSI差     : {rssi_difference} dB")
     print("============================================")
     print()
 
@@ -777,28 +792,47 @@ def evaluate_gate(
     state = transmitter_states[transmitter.serial_number]
     now_monotonic = time.monotonic()
 
-    fresh = get_fresh_receiver_data(state, now_monotonic)
-    both_receivers_fresh = len(fresh) == len(ACTIVE_RECEIVER_IDS)
+    fresh = get_fresh_receiver_data(
+        state,
+        now_monotonic,
+    )
 
-    rx1 = fresh.get("RX-0001")
-    rx2 = fresh.get("RX-0002")
+    # --------------------------------------------------------
+    # N台対応
+    #
+    # 現在新鮮なRXだけをENTRY判定に使用する。
+    # 1台でも新鮮なら判定可能。
+    # --------------------------------------------------------
 
-    rx1_avg = rx1.averaged_rssi if rx1 is not None else None
-    rx2_avg = rx2.averaged_rssi if rx2 is not None else None
+    fresh_rssi_by_receiver = {
+        receiver_id:
+            receiver_state.averaged_rssi
+        for receiver_id, receiver_state
+        in fresh.items()
+        if receiver_state.averaged_rssi
+        is not None
+    }
 
-    # 単独コース用ダイバーシティ判定
-    # RX1/RX2のどちらか一方が強ければ通過候補とする。
-    # コース端の走行やライダー身体による遮蔽に強くする。
-    fresh_values = [
-        receiver_state.averaged_rssi
-        for receiver_state in fresh.values()
-        if receiver_state.averaged_rssi is not None
-    ]
+    fresh_values = list(
+        fresh_rssi_by_receiver.values()
+    )
 
-    combined_rssi: int | None = max(fresh_values) if fresh_values else None
+    combined_rssi: int | None = (
+        max(fresh_values)
+        if fresh_values
+        else None
+    )
+
+    # RSSI差は診断用。
+    # 2台以上新鮮なRXがある場合のみ
+    # 最大値－最小値を表示する。
     rssi_difference: int | None = None
-    if both_receivers_fresh and rx1_avg is not None and rx2_avg is not None:
-        rssi_difference = abs(rx1_avg - rx2_avg)
+
+    if len(fresh_values) >= 2:
+        rssi_difference = (
+            max(fresh_values)
+            - min(fresh_values)
+        )
 
     gate_valid = bool(fresh_values)
     entry_signal = (
@@ -811,17 +845,26 @@ def evaluate_gate(
     state.last_rssi_difference = rssi_difference
 
     if now_monotonic - state.last_display_monotonic >= DISPLAY_INTERVAL_SECONDS:
-        rx1_text = str(rx1_avg) if rx1_avg is not None else "-"
-        rx2_text = str(rx2_avg) if rx2_avg is not None else "-"
+        fresh_text = " ".join(
+            f"{receiver_id}={rssi}"
+            for receiver_id, rssi
+            in sorted(
+                fresh_rssi_by_receiver.items()
+            )
+        )
+
+        if not fresh_text:
+            fresh_text = "RXなし"
+
         if entry_signal:
             judge_text = "成立候補"
         else:
             judge_text = "待機"
+
         print(
             "\r"
             f"{transmitter.serial_number}  "
-            f"RX1平均={rx1_text:>4}  "
-            f"RX2平均={rx2_text:>4}  "
+            f"{fresh_text}  "
             f"差={str(rssi_difference):>3}  "
             f"判定={judge_text:8s}  "
             f"状態={state.gate_state.name:15s}  "
@@ -831,76 +874,76 @@ def evaluate_gate(
         )
         state.last_display_monotonic = now_monotonic
 
-    rx1_state = state.receiver_states["RX-0001"]
-    rx2_state = state.receiver_states["RX-0002"]
+    # ========================================================
+    # N台対応 EXIT判定
+    #
+    # 一度でも受信したRXについて、
+    #
+    # ・平均RSSIがEXIT閾値未満
+    # または
+    # ・受信タイムアウト
+    #
+    # ならEXIT側とみなす。
+    #
+    # 一度も受信していないRXは判定対象外。
+    # ========================================================
 
-    rx1_has_data = (
-        rx1_state.rssi is not None
-        and rx1_state.last_packet_monotonic > 0.0
-    )
+    exit_ready_by_receiver = {}
 
-    rx2_has_data = (
-        rx2_state.rssi is not None
-        and rx2_state.last_packet_monotonic > 0.0
-    )
+    for receiver_id in ACTIVE_RECEIVER_IDS:
 
-    rx1_age = (
-        now_monotonic - rx1_state.last_packet_monotonic
-        if rx1_has_data
-        else None
-    )
+        receiver_state = state.receiver_states[
+            receiver_id
+        ]
 
-    rx2_age = (
-        now_monotonic - rx2_state.last_packet_monotonic
-        if rx2_has_data
-        else None
-    )
-
-    rx1_timed_out = (
-        rx1_has_data
-        and rx1_age is not None
-        and rx1_age > RECEIVER_DATA_TIMEOUT_SECONDS
-    )
-
-    rx2_timed_out = (
-        rx2_has_data
-        and rx2_age is not None
-        and rx2_age > RECEIVER_DATA_TIMEOUT_SECONDS
-    )
-
-    rx1_below_exit = (
-        rx1_avg is not None
-        and rx1_avg < EXIT_RSSI_THRESHOLD
-    )
-
-    rx2_below_exit = (
-        rx2_avg is not None
-        and rx2_avg < EXIT_RSSI_THRESHOLD
-    )
-
-    rx1_exit_ready = (
-        rx1_has_data
-        and (
-            rx1_below_exit
-            or rx1_timed_out
+        has_data = (
+            receiver_state.rssi is not None
+            and
+            receiver_state.last_packet_monotonic
+            > 0.0
         )
-    )
 
-    rx2_exit_ready = (
-        rx2_has_data
-        and (
-            rx2_below_exit
-            or rx2_timed_out
+        if not has_data:
+            continue
+
+        age = (
+            now_monotonic
+            - receiver_state.last_packet_monotonic
         )
-    )
 
-    both_below_exit = (
-        rx1_exit_ready
-        and rx2_exit_ready
+        timed_out = (
+            age
+            > RECEIVER_DATA_TIMEOUT_SECONDS
+        )
+
+        averaged_rssi = (
+            receiver_state.averaged_rssi
+        )
+
+        below_exit = (
+            averaged_rssi is not None
+            and averaged_rssi
+            < EXIT_RSSI_THRESHOLD
+        )
+
+        exit_ready_by_receiver[
+            receiver_id
+        ] = (
+            below_exit
+            or timed_out
+        )
+
+    # 少なくとも1台は過去に受信しており、
+    # その全RXがEXIT側なら離脱候補
+    all_receivers_exit_ready = (
+        bool(exit_ready_by_receiver)
+        and all(
+            exit_ready_by_receiver.values()
+        )
     )
 
     if state.waiting_for_clear_after_reset:
-        if both_below_exit:
+        if all_receivers_exit_ready:
             if state.exit_candidate_since is None:
                 state.exit_candidate_since = now_monotonic
             if now_monotonic - state.exit_candidate_since >= EXIT_CONFIRM_SECONDS:
@@ -948,15 +991,20 @@ def evaluate_gate(
             return
 
         reference_packet = select_reference_packet(fresh)
-        if reference_packet is None or combined_rssi is None or rssi_difference is None:
+        if (
+            reference_packet is None
+            or combined_rssi is None
+        ):
             return
 
         if DEBUG_ENTRY:
             print()
             print(
                 f"[ダイバーシティENTRY成立] {transmitter.serial_number} "
-                f"経過={entry_elapsed:.2f}秒 統合RSSI={combined_rssi} dBm "
-                f"差={rssi_difference} dB"
+                f"経過={entry_elapsed:.2f}秒 "
+                f"統合RSSI={combined_rssi} dBm "
+                f"有効RX={len(fresh_values)} "
+                f"差={rssi_difference}"
             )
 
         state.entry_candidate_since = None
@@ -972,7 +1020,7 @@ def evaluate_gate(
         return
 
     if state.gate_state == GateState.INSIDE:
-        if both_below_exit:
+        if all_receivers_exit_ready:
             state.gate_state = GateState.EXIT_CANDIDATE
             state.exit_candidate_since = now_monotonic
             print()
@@ -980,7 +1028,7 @@ def evaluate_gate(
         return
 
     if state.gate_state == GateState.EXIT_CANDIDATE:
-        if not both_below_exit:
+        if not all_receivers_exit_ready:
             state.exit_candidate_since = None
             state.gate_state = GateState.INSIDE
             print()
