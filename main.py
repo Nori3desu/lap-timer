@@ -8,6 +8,8 @@ import time
 import subprocess
 import threading
 import os
+import socket
+import re
 
 from ranking import (
     get_ranking,
@@ -765,6 +767,631 @@ def view(my_minor: int | None = None):
 
     return html_text
 
+
+
+# ============================================================
+# レシーバー リモート管理
+# ============================================================
+
+RECEIVER_CONTROL_PORT = 5101
+RECEIVER_IP_PREFIX = "192.168.4."
+
+
+def receiver_ip_from_id(receiver_id: str):
+    """
+    RX-0001 -> 192.168.4.101
+    RX-0002 -> 192.168.4.102
+    RX-0003 -> 192.168.4.103
+    """
+    match = re.fullmatch(
+        r"RX-(\d{4})",
+        receiver_id,
+    )
+
+    if match is None:
+        return None
+
+    number = int(match.group(1))
+
+    host = 100 + number
+
+    if host < 1 or host > 254:
+        return None
+
+    return (
+        RECEIVER_IP_PREFIX
+        + str(host)
+    )
+
+
+def get_known_receiver_ids():
+    """
+    DBに記録されたreceiver_idから
+    管理対象RXを自動取得する。
+    """
+
+    db_path = os.path.join(
+        os.path.dirname(__file__),
+        "lap_timer.db",
+    )
+
+    receiver_ids = set()
+
+    conn = sqlite3.connect(
+        db_path,
+        timeout=5.0,
+    )
+
+    try:
+        cur = conn.cursor()
+
+        # RSSIログ
+        try:
+            cur.execute(
+                """
+                SELECT DISTINCT receiver_id
+                FROM rssi_logs
+                WHERE receiver_id IS NOT NULL
+                """
+            )
+
+            for row in cur.fetchall():
+                receiver_id = str(row[0])
+
+                if receiver_ip_from_id(
+                    receiver_id
+                ) is not None:
+                    receiver_ids.add(
+                        receiver_id
+                    )
+
+        except sqlite3.OperationalError:
+            pass
+
+        # バッテリー受信履歴
+        try:
+            cur.execute(
+                """
+                SELECT DISTINCT receiver_id
+                FROM transmitter_battery_receivers
+                WHERE receiver_id IS NOT NULL
+                """
+            )
+
+            for row in cur.fetchall():
+                receiver_id = str(row[0])
+
+                if receiver_ip_from_id(
+                    receiver_id
+                ) is not None:
+                    receiver_ids.add(
+                        receiver_id
+                    )
+
+        except sqlite3.OperationalError:
+            pass
+
+    finally:
+        conn.close()
+
+    return sorted(receiver_ids)
+
+
+def send_receiver_control(
+    receiver_id: str,
+    command: str,
+    timeout: float = 1.5,
+):
+    ip_address = receiver_ip_from_id(
+        receiver_id
+    )
+
+    if ip_address is None:
+        return {
+            "ok": False,
+            "receiver_id": receiver_id,
+            "ip": None,
+            "message": "RX ID形式エラー",
+        }
+
+    message = (
+        f"{command},{receiver_id}"
+    ).encode("utf-8")
+
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM,
+    )
+
+    sock.settimeout(timeout)
+
+    try:
+        sock.sendto(
+            message,
+            (
+                ip_address,
+                RECEIVER_CONTROL_PORT,
+            ),
+        )
+
+        data, address = sock.recvfrom(
+            1024
+        )
+
+        response = data.decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+
+        expected = (
+            f"ACK,{command},{receiver_id}"
+        )
+
+        return {
+            "ok": response == expected,
+            "receiver_id": receiver_id,
+            "ip": ip_address,
+            "message": response,
+        }
+
+    except socket.timeout:
+        return {
+            "ok": False,
+            "receiver_id": receiver_id,
+            "ip": ip_address,
+            "message": "応答なし",
+        }
+
+    except OSError as exc:
+        return {
+            "ok": False,
+            "receiver_id": receiver_id,
+            "ip": ip_address,
+            "message": str(exc),
+        }
+
+    finally:
+        sock.close()
+
+
+def receiver_control_result_page(
+    title: str,
+    results,
+):
+    rows = ""
+
+    for result in results:
+        receiver_id = html.escape(
+            str(result["receiver_id"])
+        )
+
+        ip_address = html.escape(
+            str(result.get("ip") or "-")
+        )
+
+        message = html.escape(
+            str(result.get("message") or "")
+        )
+
+        if result["ok"]:
+            status = "🟢 成功"
+        else:
+            status = "🔴 失敗"
+
+        rows += f"""
+        <div style="
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:10px;
+            padding:14px;
+            margin-bottom:10px;
+        ">
+            <div style="font-size:1.15em;font-weight:800;">
+                {receiver_id}
+            </div>
+            <div>IP：{ip_address}</div>
+            <div>{status}</div>
+            <div style="font-size:0.9em;color:#555;">
+                {message}
+            </div>
+        </div>
+        """
+
+    return HTMLResponse(
+        f"""
+        <!DOCTYPE html>
+        <html lang="ja">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+            <title>{html.escape(title)}</title>
+        </head>
+        <body style="
+            font-family:-apple-system,BlinkMacSystemFont,
+            'Segoe UI',sans-serif;
+            max-width:720px;
+            margin:0 auto;
+            padding:20px;
+            background:#f5f5f5;
+        ">
+            <h1>{html.escape(title)}</h1>
+
+            {rows}
+
+            <a href="/admin/receivers"
+               style="
+                   display:block;
+                   text-align:center;
+                   padding:14px;
+                   background:#333;
+                   color:#fff;
+                   text-decoration:none;
+                   border-radius:10px;
+                   margin-top:18px;
+               ">
+                レシーバー管理へ戻る
+            </a>
+        </body>
+        </html>
+        """
+    )
+
+
+@app.get(
+    "/admin/receivers",
+    response_class=HTMLResponse,
+)
+def receiver_admin():
+    receiver_ids = (
+        get_known_receiver_ids()
+    )
+
+    cards = ""
+
+    for receiver_id in receiver_ids:
+        ip_address = (
+            receiver_ip_from_id(
+                receiver_id
+            )
+        )
+
+        ping_result = (
+            send_receiver_control(
+                receiver_id,
+                "PING",
+                timeout=0.6,
+            )
+        )
+
+        if ping_result["ok"]:
+            status_text = "🟢 ONLINE"
+            status_color = "#198754"
+        else:
+            status_text = "🔴 応答なし"
+            status_color = "#dc3545"
+
+        safe_receiver_id = html.escape(
+            receiver_id
+        )
+
+        safe_ip = html.escape(
+            str(ip_address)
+        )
+
+        cards += f"""
+        <div style="
+            background:#fff;
+            border:1px solid #ddd;
+            border-radius:12px;
+            padding:16px;
+            margin-bottom:14px;
+        ">
+            <div style="
+                font-size:1.25em;
+                font-weight:800;
+            ">
+                {safe_receiver_id}
+            </div>
+
+            <div style="margin-top:5px;">
+                IP：{safe_ip}
+            </div>
+
+            <div style="
+                margin-top:5px;
+                font-weight:800;
+                color:{status_color};
+            ">
+                {status_text}
+            </div>
+
+            <form
+                method="post"
+                action="/admin/receivers/restart"
+                style="margin-top:12px;"
+                onsubmit="return confirm(
+                    '{safe_receiver_id} を再起動しますか？'
+                );"
+            >
+                <input
+                    type="hidden"
+                    name="receiver_id"
+                    value="{safe_receiver_id}"
+                >
+
+                <button
+                    type="submit"
+                    style="
+                        width:100%;
+                        padding:12px;
+                        font-size:1em;
+                        font-weight:700;
+                    "
+                >
+                    {safe_receiver_id} を再起動
+                </button>
+            </form>
+        </div>
+        """
+
+    if not cards:
+        cards = """
+        <div style="
+            background:#fff3cd;
+            padding:15px;
+            border-radius:10px;
+        ">
+            管理対象レシーバーが
+            DBから見つかりません。
+        </div>
+        """
+
+    return HTMLResponse(
+        f"""
+        <!DOCTYPE html>
+        <html lang="ja">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+            <title>レシーバー管理</title>
+        </head>
+
+        <body style="
+            font-family:-apple-system,BlinkMacSystemFont,
+            'Segoe UI',sans-serif;
+            max-width:720px;
+            margin:0 auto;
+            padding:20px;
+            background:#f5f5f5;
+        ">
+
+            <h1>レシーバー管理</h1>
+
+            <div style="
+                background:#e7f1ff;
+                border:1px solid #9ec5fe;
+                border-radius:10px;
+                padding:14px;
+                margin-bottom:18px;
+            ">
+                コース検証・本番計測開始前に
+                レシーバーを再起動できます。
+                <br>
+                RX台数はDBから自動取得します。
+            </div>
+
+            {cards}
+
+            <form
+                method="post"
+                action="/admin/receivers/restart-all"
+                onsubmit="return confirm(
+                    '全レシーバーを再起動しますか？'
+                );"
+            >
+                <button
+                    type="submit"
+                    style="
+                        width:100%;
+                        padding:15px;
+                        margin-top:10px;
+                        font-size:1.05em;
+                        font-weight:800;
+                        background:#dc3545;
+                        color:#fff;
+                        border:0;
+                        border-radius:10px;
+                    "
+                >
+                    全レシーバーを再起動
+                </button>
+            </form>
+
+            <a href="/admin"
+               style="
+                   display:block;
+                   text-align:center;
+                   padding:14px;
+                   margin-top:20px;
+                   background:#333;
+                   color:#fff;
+                   text-decoration:none;
+                   border-radius:10px;
+               ">
+                管理者メニューへ戻る
+            </a>
+
+        </body>
+        </html>
+        """
+    )
+
+
+@app.post(
+    "/admin/receivers/restart",
+    response_class=HTMLResponse,
+)
+def restart_receiver(
+    receiver_id: str = Form(...),
+):
+    known_receivers = (
+        get_known_receiver_ids()
+    )
+
+    if receiver_id not in known_receivers:
+        return receiver_control_result_page(
+            "レシーバー再起動",
+            [
+                {
+                    "ok": False,
+                    "receiver_id":
+                        receiver_id,
+                    "ip": None,
+                    "message":
+                        "未登録RXです",
+                }
+            ],
+        )
+
+    restart_result = (
+        send_receiver_control(
+            receiver_id,
+            "RESTART",
+            timeout=2.0,
+        )
+    )
+
+    # ACK受信後、RXの再起動と
+    # Wi-Fi復帰を待つ。
+    if restart_result["ok"]:
+        time.sleep(5.0)
+
+        recovered = False
+        last_ping = None
+
+        for _ in range(8):
+            last_ping = (
+                send_receiver_control(
+                    receiver_id,
+                    "PING",
+                    timeout=0.8,
+                )
+            )
+
+            if last_ping["ok"]:
+                recovered = True
+                break
+
+            time.sleep(1.0)
+
+        if recovered:
+            restart_result[
+                "message"
+            ] = (
+                "再起動ACK受信 / "
+                "PING復帰確認OK"
+            )
+        else:
+            restart_result["ok"] = False
+            restart_result[
+                "message"
+            ] = (
+                "再起動ACK受信 / "
+                "PING復帰確認できず"
+            )
+
+    return receiver_control_result_page(
+        "レシーバー再起動結果",
+        [restart_result],
+    )
+
+
+@app.post(
+    "/admin/receivers/restart-all",
+    response_class=HTMLResponse,
+)
+def restart_all_receivers():
+    receiver_ids = (
+        get_known_receiver_ids()
+    )
+
+    restart_results = []
+
+    # まず全RXへRESTARTを送る。
+    for receiver_id in receiver_ids:
+        restart_results.append(
+            send_receiver_control(
+                receiver_id,
+                "RESTART",
+                timeout=2.0,
+            )
+        )
+
+    # 再起動待ち
+    time.sleep(5.0)
+
+    final_results = []
+
+    # 各RXの復帰を確認する。
+    for restart_result in restart_results:
+        receiver_id = (
+            restart_result[
+                "receiver_id"
+            ]
+        )
+
+        if not restart_result["ok"]:
+            final_results.append(
+                restart_result
+            )
+            continue
+
+        recovered = False
+
+        for _ in range(8):
+            ping_result = (
+                send_receiver_control(
+                    receiver_id,
+                    "PING",
+                    timeout=0.8,
+                )
+            )
+
+            if ping_result["ok"]:
+                recovered = True
+                break
+
+            time.sleep(1.0)
+
+        if recovered:
+            restart_result[
+                "message"
+            ] = (
+                "再起動ACK受信 / "
+                "PING復帰確認OK"
+            )
+        else:
+            restart_result["ok"] = False
+            restart_result[
+                "message"
+            ] = (
+                "再起動ACK受信 / "
+                "PING復帰確認できず"
+            )
+
+        final_results.append(
+            restart_result
+        )
+
+    return receiver_control_result_page(
+        "全レシーバー再起動結果",
+        final_results,
+    )
+
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin():
     setup_mode = get_setup_mode()
@@ -1129,6 +1756,8 @@ def admin():
         {"<a href='/lite/result' target='_blank'>リザルト</a>" if is_lite else "<a href='/live' target='_blank'>リザルト</a>"}
 
         <a href="/admin/rssi-monitor">RSSIモニタ</a>
+
+        <a href="/admin/receivers">📡 レシーバー管理</a>
 
         <a href="/admin/rssi-settings">RSSI設定</a>
 
