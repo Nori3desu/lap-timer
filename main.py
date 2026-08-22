@@ -2293,6 +2293,141 @@ def rssi_monitor():
 
 
 # ============================================================
+# リセット後クリア待ち状態
+# ============================================================
+
+def get_latest_gate_state_event():
+    db_path = os.path.join(
+        os.path.dirname(__file__),
+        "lap_timer.db",
+    )
+
+    conn = sqlite3.connect(
+        db_path,
+        timeout=5.0,
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                serial_number,
+                event_type,
+                timestamp,
+                detail
+            FROM gate_state_events
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """
+        )
+
+        row = cur.fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    except sqlite3.OperationalError:
+        return None
+
+    finally:
+        conn.close()
+
+
+def get_gate_status_html():
+    event = get_latest_gate_state_event()
+
+    if event is None:
+        return (
+            '<div style="'
+            'margin:0 0 16px 0;'
+            'padding:12px 14px;'
+            'border-radius:10px;'
+            'background:#f3f4f6;'
+            'font-weight:700;'
+            '">'
+            '⚪ 計測状態：履歴なし'
+            '</div>'
+        )
+
+    event_type = event.get(
+        "event_type"
+    )
+
+    event_time = event.get(
+        "timestamp"
+    )
+
+    time_text = ""
+
+    if event_time is not None:
+        time_text = time.strftime(
+            "%H:%M:%S",
+            time.localtime(event_time),
+        )
+
+    if event_type == "RESET_WAITING_CLEAR":
+        return (
+            '<div style="'
+            'margin:0 0 16px 0;'
+            'padding:14px;'
+            'border-radius:10px;'
+            'background:#fff3cd;'
+            'border:1px solid #ffca2c;'
+            '">'
+            '<div style="font-weight:800;">'
+            '🟠 リセット後クリア待ち'
+            '</div>'
+            '<div style="margin-top:5px;">'
+            'TXをゲートから十分離してください。'
+            '<br>'
+            '周回計測はまだ開始されていません。'
+            '</div>'
+            f'<div style="margin-top:5px;font-size:0.85em;">'
+            f'状態更新：{time_text}'
+            '</div>'
+            '</div>'
+        )
+
+    if event_type == "MEASUREMENT_READY":
+        return (
+            '<div style="'
+            'margin:0 0 16px 0;'
+            'padding:14px;'
+            'border-radius:10px;'
+            'background:#d1e7dd;'
+            'border:1px solid #75b798;'
+            '">'
+            '<div style="font-weight:800;">'
+            '🟢 計測準備OK'
+            '</div>'
+            '<div style="margin-top:5px;">'
+            '次の通過から周回を記録します。'
+            '</div>'
+            f'<div style="margin-top:5px;font-size:0.85em;">'
+            f'状態更新：{time_text}'
+            '</div>'
+            '</div>'
+        )
+
+    return (
+        '<div style="'
+        'margin:0 0 16px 0;'
+        'padding:12px 14px;'
+        'border-radius:10px;'
+        'background:#f3f4f6;'
+        '">'
+        '⚪ 計測状態：確認中'
+        '</div>'
+    )
+
+
+# ============================================================
 # RSSI 通過検証ログ
 # ============================================================
 
@@ -2381,6 +2516,33 @@ def get_rssi_pass_events(
         dict(row)
         for row in cur.fetchall()
     ]
+
+    gate_state_rows = []
+
+    try:
+        cur.execute(
+            """
+            SELECT
+                serial_number,
+                event_type,
+                timestamp,
+                detail
+            FROM gate_state_events
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (
+                since - 60.0,
+            ),
+        )
+
+        gate_state_rows = [
+            dict(row)
+            for row in cur.fetchall()
+        ]
+
+    except sqlite3.OperationalError:
+        gate_state_rows = []
 
     conn.close()
 
@@ -2764,6 +2926,41 @@ def get_rssi_pass_events(
             ]
 
             # --------------------------------------------
+            # 周回記録なしの理由判定
+            #
+            # 通過ピーク時点で最後の状態イベントが
+            # RESET_WAITING_CLEAR なら、
+            # リセット後クリア待ち中だったと判定する。
+            #
+            # 現在はTX-0003 1台運用のため、
+            # 最新の状態履歴を時刻で照合する。
+            # --------------------------------------------
+
+            no_lap_reason = None
+
+            if not matched_laps:
+                latest_gate_event = None
+
+                for gate_event in gate_state_rows:
+                    if (
+                        gate_event["timestamp"]
+                        <= peak_time
+                    ):
+                        latest_gate_event = gate_event
+                    else:
+                        break
+
+                if (
+                    latest_gate_event is not None
+                    and latest_gate_event[
+                        "event_type"
+                    ] == "RESET_WAITING_CLEAR"
+                ):
+                    no_lap_reason = (
+                        "リセット後クリア待ち"
+                    )
+
+            # --------------------------------------------
             # 1秒単位でRX1/RX2の最大RSSIをまとめる
             # --------------------------------------------
 
@@ -2920,6 +3117,9 @@ def get_rssi_pass_events(
                     "matched_laps":
                         matched_laps,
 
+                    "no_lap_reason":
+                        no_lap_reason,
+
                     "timeline":
                         timeline,
 
@@ -2942,6 +3142,10 @@ def get_rssi_pass_events(
     response_class=HTMLResponse,
 )
 def rssi_pass_log():
+
+    gate_status_html = (
+        get_gate_status_html()
+    )
 
     events = get_rssi_pass_events(
         minutes=20,
@@ -3172,6 +3376,13 @@ def rssi_pass_log():
             </div>
     """
 
+    html_text = html_text.replace(
+        "<h1>通過検証ログ</h1>",
+        gate_status_html
+        + "<h1>通過検証ログ</h1>",
+        1,
+    )
+
     if not events:
         html_text += """
             <div class="empty">
@@ -3208,6 +3419,20 @@ def rssi_pass_log():
                 '△ 周回記録なし'
                 '</span>'
             )
+
+            no_lap_reason = event.get(
+                "no_lap_reason"
+            )
+
+            if no_lap_reason:
+                lap_badge += (
+                    '<div style="'
+                    'margin-top:6px;'
+                    'font-weight:700;'
+                    '">'
+                    f'理由：{no_lap_reason}'
+                    '</div>'
+                )
 
         if event["exit_completed"]:
             exit_badge = (
