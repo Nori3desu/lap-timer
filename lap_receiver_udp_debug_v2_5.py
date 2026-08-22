@@ -81,6 +81,78 @@ RSSI_MOVING_AVERAGE_SAMPLES = 3
 
 
 # ============================================================
+# ゲート状態履歴
+# ============================================================
+
+def initialize_gate_state_event_database() -> None:
+    connection = sqlite3.connect(
+        WEB_DATABASE_PATH,
+        timeout=5.0,
+    )
+
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gate_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                serial_number TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                detail TEXT
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_gate_state_events_timestamp
+            ON gate_state_events(timestamp)
+            """
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+
+def save_gate_state_event(
+    transmitter: RegisteredTransmitter,
+    event_type: str,
+    detail: str = "",
+) -> None:
+    connection = sqlite3.connect(
+        WEB_DATABASE_PATH,
+        timeout=5.0,
+    )
+
+    try:
+        connection.execute(
+            """
+            INSERT INTO gate_state_events (
+                serial_number,
+                event_type,
+                timestamp,
+                detail
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                transmitter.serial_number,
+                event_type,
+                time.time(),
+                detail,
+            ),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+
+# ============================================================
 # 登録送信機
 # ============================================================
 
@@ -950,6 +1022,13 @@ def evaluate_gate(
                 state.waiting_for_clear_after_reset = False
                 state.gate_state = GateState.WAIT
                 state.exit_candidate_since = None
+
+                save_gate_state_event(
+                    transmitter=transmitter,
+                    event_type="MEASUREMENT_READY",
+                    detail="リセット後クリア確認完了",
+                )
+
                 print()
                 print(f"[リセット後のゾーン離脱確認] {transmitter.serial_number}")
                 print("次の通過から計測を開始します。")
@@ -1081,7 +1160,11 @@ def process_lite_reset_request(
     connection.execute("DELETE FROM laps")
     connection.commit()
 
-    for state in transmitter_states.values():
+    for transmitter in REGISTERED_TRANSMITTERS:
+        state = transmitter_states[
+            transmitter.serial_number
+        ]
+
         state.gate_state = GateState.INSIDE
         state.last_lap_monotonic = None
         state.last_lap_datetime = None
@@ -1107,6 +1190,12 @@ def process_lite_reset_request(
         state.last_gate_valid = False
         state.last_combined_rssi = None
         state.last_rssi_difference = None
+
+        save_gate_state_event(
+            transmitter=transmitter,
+            event_type="RESET_WAITING_CLEAR",
+            detail="リセット後クリア待ち開始",
+        )
 
     try:
         RESET_REQUEST_PATH.unlink()
@@ -1540,6 +1629,7 @@ async def main() -> None:
         register_transmitters(connection)
         load_existing_lap_counts(connection)
         initialize_battery_database()
+        initialize_gate_state_event_database()
 
         event_loop = asyncio.get_running_loop()
 
