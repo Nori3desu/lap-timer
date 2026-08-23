@@ -206,6 +206,7 @@ def get_lite_summary(race_id):
         "latest_lap": None,
         "best_lap": None,
         "avg_lap": None,
+        "lap_history": [],
     }
 
     if race_id is None:
@@ -241,6 +242,19 @@ def get_lite_summary(race_id):
         (race_id,),
     ).fetchone()
 
+    history = cur.execute(
+        """
+        SELECT lap_number, lap_time
+        FROM laps
+        WHERE race_id = ?
+          AND lap_number > 0
+          AND lap_time > 0
+        ORDER BY lap_number DESC
+        LIMIT 10
+        """,
+        (race_id,),
+    ).fetchall()
+
     conn.close()
 
     if row is not None:
@@ -252,7 +266,57 @@ def get_lite_summary(race_id):
     if latest is not None:
         summary["latest_lap"] = latest["lap_time"]
 
+    summary["lap_history"] = [
+        {
+            "lap_number": int(item["lap_number"]),
+            "lap_time": float(item["lap_time"]),
+        }
+        for item in reversed(history)
+    ]
+
     return summary
+
+
+def build_lite_lap_history(summary):
+    history = summary.get("lap_history", [])
+
+    if not history:
+        return ""
+
+    best_lap = summary.get("best_lap")
+
+    rows = []
+
+    for item in history:
+        is_best = (
+            best_lap is not None
+            and abs(item["lap_time"] - best_lap) < 0.001
+        )
+
+        best_html = (
+            '<span class="best-mark">BEST</span>'
+            if is_best
+            else ""
+        )
+
+        rows.append(
+            f"""
+            <div class="lap-history-row">
+                <span class="lap-number">
+                    {item["lap_number"]}周目
+                </span>
+                <strong>{format_time(item["lap_time"])}</strong>
+                {best_html}
+            </div>
+            """
+        )
+
+    return f"""
+    <div class="lap-history">
+        <div class="lap-history-title">ラップ履歴</div>
+        {''.join(rows)}
+    </div>
+    """
 
 
 def write_lite_reset_request():
@@ -297,6 +361,7 @@ def root():
 
     current_race_id = get_current_race_id()
     summary = get_lite_summary(current_race_id)
+    lap_history_html = build_lite_lap_history(summary)
     active = is_race_active()
 
     if active:
@@ -330,6 +395,7 @@ def root():
           <div><span>ベスト</span><strong>{format_time(summary['best_lap'])}</strong></div>
           <div><span>平均</span><strong>{format_time(summary['avg_lap'])}</strong></div>
         </div>
+        {lap_history_html}
         <form action="/lite/stop" method="post"><button class="stop" type="submit">■ 計測ストップ</button></form>
         """
     else:
@@ -340,6 +406,7 @@ def root():
           <div><span>ベスト</span><strong>{format_time(summary['best_lap'])}</strong></div>
           <div><span>平均</span><strong>{format_time(summary['avg_lap'])}</strong></div>
         </div>
+        {lap_history_html}
         <p><a class="result-button" href="/lite/result">リザルトを見る</a></p>
         <form action="/lite/start" method="post"><button class="start" type="submit">▶ 新しく計測スタート</button></form>
         """
@@ -359,6 +426,37 @@ def root():
     button,.result-button {{ box-sizing:border-box; display:inline-block; width:100%; max-width:360px; border:0; border-radius:12px; padding:17px 14px; margin-top:20px; font-size:22px; font-weight:700; text-decoration:none; cursor:pointer; }}
     button.start {{ background:#1677ff; color:white; }} button.stop {{ background:#333; color:white; }} .result-button {{ background:#e9eef5; color:#222; }}
     .sub-link {{ margin-top:24px; }} .sub-link a {{ color:#444; }}
+
+    .lap-history {{
+        margin-top:24px;
+        padding:16px;
+        background:#f6f6f6;
+        border-radius:14px;
+        text-align:left;
+    }}
+
+    .lap-history-title {{
+        font-size:17px;
+        font-weight:700;
+        margin-bottom:10px;
+    }}
+
+    .lap-history-row {{
+        display:grid;
+        grid-template-columns:70px 1fr 55px;
+        align-items:center;
+        padding:5px 0;
+        font-variant-numeric:tabular-nums;
+    }}
+
+    .lap-history-row strong {{
+        font-size:18px;
+    }}
+
+    .best-mark {{
+        font-size:13px;
+        font-weight:700;
+    }}
     </style></head><body><div class="wrap"><h1>Lite ラップタイマー</h1><div class="card">{state_html}</div></div></body></html>
     """
 
