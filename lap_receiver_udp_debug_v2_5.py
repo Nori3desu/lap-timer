@@ -478,8 +478,14 @@ def load_existing_lap_counts(connection: sqlite3.Connection) -> None:
 
         try:
             state.last_lap_datetime = datetime.fromisoformat(passed_at)
+            elapsed_since_pass = max(
+                0.0,
+                (datetime.now() - state.last_lap_datetime).total_seconds(),
+            )
+            state.last_lap_monotonic = time.monotonic() - elapsed_since_pass
         except (TypeError, ValueError):
             state.last_lap_datetime = None
+            state.last_lap_monotonic = None
 
 
 def save_detail_lap(
@@ -564,6 +570,34 @@ def save_web_rssi_log(
             f"{transmitter.serial_number}: {error}"
         )
 
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+# ============================================================
+# Liteラップ記録ON/OFF
+# ============================================================
+
+def is_lite_lap_recording_enabled() -> bool:
+    """Liteではrace_active=1の間だけラップ保存する。診断処理は常時継続。"""
+    connection = None
+    try:
+        connection = sqlite3.connect(WEB_DATABASE_PATH, timeout=2.0)
+        rows = connection.execute(
+            """
+            SELECT key, value
+            FROM settings
+            WHERE key IN ('product_mode', 'race_active')
+            """
+        ).fetchall()
+        settings = {key: value for key, value in rows}
+        if settings.get("product_mode", "event") == "lite":
+            return settings.get("race_active", "0") == "1"
+        return True
+    except sqlite3.Error as error:
+        print(f"[Lite状態確認エラー] {error}")
+        return False
     finally:
         if connection is not None:
             connection.close()
@@ -696,38 +730,40 @@ def record_lap(
     combined_rssi: int,
     rssi_difference: int | None,
 ) -> None:
+    # Lite停止中でもゲート診断は継続するが、ラップは保存しない。
+    if not is_lite_lap_recording_enabled():
+        save_gate_state_event(
+            transmitter=transmitter,
+            event_type="LITE_LAP_IGNORED_STOPPED",
+            detail=f"combined={combined_rssi} diff={rssi_difference}",
+        )
+        return
+
     now_monotonic = time.monotonic()
+    first_pass = state.last_lap_monotonic is None
 
-    if state.last_lap_monotonic is not None:
+    if first_pass:
+        state.lap_count = 0
+        lap_time_seconds = 0.0
+    else:
         elapsed = now_monotonic - state.last_lap_monotonic
-
         if elapsed < MINIMUM_LAP_SECONDS:
             remaining = MINIMUM_LAP_SECONDS - elapsed
-
             save_gate_state_event(
                 transmitter=transmitter,
                 event_type="LAP_BLOCKED_MIN_TIME",
                 detail=(
-                    f"elapsed={elapsed:.3f} "
-                    f"remaining={remaining:.3f} "
-                    f"minimum={MINIMUM_LAP_SECONDS:.3f} "
-                    f"combined={combined_rssi} "
+                    f"elapsed={elapsed:.3f} remaining={remaining:.3f} "
+                    f"minimum={MINIMUM_LAP_SECONDS:.3f} combined={combined_rssi} "
                     f"diff={rssi_difference}"
                 ),
             )
-
             print()
-            print(
-                f"[判定保留] {transmitter.serial_number} "
-                f"最短ラップ時間まで残り {remaining:.1f} 秒"
-            )
+            print(f"[判定保留] {transmitter.serial_number} 最短ラップ時間まで残り {remaining:.1f} 秒")
             return
+        state.lap_count += 1
+        lap_time_seconds = elapsed
 
-    lap_time_seconds: float | None = None
-    if state.last_lap_monotonic is not None:
-        lap_time_seconds = now_monotonic - state.last_lap_monotonic
-
-    state.lap_count += 1
     state.last_lap_monotonic = now_monotonic
     state.last_lap_datetime = packet.received_at
 
@@ -736,40 +772,26 @@ def record_lap(
         event_type="LAP_RECORDED",
         detail=(
             f"lap={state.lap_count} "
-            f"lap_time="
-            f"{lap_time_seconds if lap_time_seconds is not None else 'FIRST'} "
-            f"combined={combined_rssi} "
-            f"diff={rssi_difference}"
+            f"lap_time={'START' if first_pass else f'{lap_time_seconds:.3f}'} "
+            f"combined={combined_rssi} diff={rssi_difference}"
         ),
     )
 
     save_detail_lap(
-        connection=connection,
-        transmitter=transmitter,
-        state=state,
-        packet=packet,
-        lap_time_seconds=lap_time_seconds,
-        combined_rssi=combined_rssi,
+        connection=connection, transmitter=transmitter, state=state, packet=packet,
+        lap_time_seconds=lap_time_seconds, combined_rssi=combined_rssi,
     )
 
     try:
         save_web_lap(
-            name=transmitter.rider_name,
-            major=transmitter.major,
-            lap_number=state.lap_count,
-            lap_time=lap_time_seconds,
+            name=transmitter.rider_name, major=transmitter.major,
+            lap_number=state.lap_count, lap_time=lap_time_seconds,
         )
     except Exception as error:
         print()
-        print(
-            f"[Webラップ保存エラー] "
-            f"{transmitter.serial_number}: {error}"
-        )
+        print(f"[Webラップ保存エラー] {transmitter.serial_number}: {error}")
 
-    active_receiver_text = ", ".join(
-        sorted(ACTIVE_RECEIVER_IDS)
-    )
-
+    active_receiver_text = ", ".join(sorted(ACTIVE_RECEIVER_IDS))
     print()
     print()
     print("============================================")
@@ -782,34 +804,13 @@ def record_lap(
     print(f"ライダー   : {transmitter.rider_name}")
     print(f"車両       : {transmitter.bike_name}")
     print(f"ラップ番号 : {state.lap_count}")
-    print(
-        "通過時刻   : "
-        f"{packet.received_at.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"
-    )
-
-    if lap_time_seconds is None:
-        print("ラップタイム: 初回通過")
-    else:
-        print(f"ラップタイム: {lap_time_seconds:.3f} 秒")
-
+    print("通過時刻   : " + packet.received_at.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
+    print("ラップタイム: START" if first_pass else f"ラップタイム: {lap_time_seconds:.3f} 秒")
     for receiver_id in sorted(ACTIVE_RECEIVER_IDS):
-        receiver_state = state.receiver_states[
-            receiver_id
-        ]
-
-        receiver_rssi = receiver_state.rssi
-
-        print(
-            f"{receiver_id:<11}: "
-            f"{receiver_rssi} dBm"
-        )
-
+        receiver_rssi = state.receiver_states[receiver_id].rssi
+        print(f"{receiver_id:<11}: {receiver_rssi} dBm")
     print(f"統合RSSI   : {combined_rssi} dBm")
-
-    if rssi_difference is None:
-        print("RSSI差     : -")
-    else:
-        print(f"RSSI差     : {rssi_difference} dB")
+    print("RSSI差     : -" if rssi_difference is None else f"RSSI差     : {rssi_difference} dB")
     print("============================================")
     print()
 

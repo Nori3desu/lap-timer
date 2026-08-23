@@ -21,6 +21,7 @@ from database import (
     init_db,
     clear_laps,
     set_race_active,
+    is_race_active,
     get_all_devices,
     get_device_by_mac,
     upsert_device,
@@ -53,14 +54,11 @@ def startup():
 
     product_mode = get_product_mode()
 
+    # LiteはWebサービス起動時に自動計測しない。
+    # BLE/RSSI受信サービスは別プロセスで動作を継続する。
     if product_mode == "lite":
-        current_race_id = get_current_race_id()
-
-        if current_race_id is None:
-            create_new_race()
-
-        set_setup_mode("race")
-        set_race_active(True)
+        set_race_active(False)
+        set_setup_mode("entry")
 
 def format_time(sec):
     if sec is None:
@@ -201,123 +199,170 @@ def get_pi_temperature():
 
     return float(temp_raw) / 1000
 
+def get_lite_summary(race_id):
+    summary = {
+        "has_start": False,
+        "laps": 0,
+        "latest_lap": None,
+        "best_lap": None,
+        "avg_lap": None,
+    }
+
+    if race_id is None:
+        return summary
+
+    conn = sqlite3.connect("lap_timer.db")
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    row = cur.execute(
+        """
+        SELECT
+            COUNT(*) AS pass_count,
+            MAX(lap_number) AS laps,
+            MIN(NULLIF(lap_time, 0)) AS best_lap,
+            AVG(NULLIF(lap_time, 0)) AS avg_lap
+        FROM laps
+        WHERE race_id = ?
+        """,
+        (race_id,),
+    ).fetchone()
+
+    latest = cur.execute(
+        """
+        SELECT lap_time
+        FROM laps
+        WHERE race_id = ?
+          AND lap_number > 0
+          AND lap_time > 0
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (race_id,),
+    ).fetchone()
+
+    conn.close()
+
+    if row is not None:
+        summary["has_start"] = int(row["pass_count"] or 0) > 0
+        summary["laps"] = int(row["laps"] or 0)
+        summary["best_lap"] = row["best_lap"]
+        summary["avg_lap"] = row["avg_lap"]
+
+    if latest is not None:
+        summary["latest_lap"] = latest["lap_time"]
+
+    return summary
+
+
+def write_lite_reset_request():
+    reset_request_path = os.path.join(
+        os.path.dirname(__file__),
+        "lite_reset.request",
+    )
+    with open(reset_request_path, "w", encoding="utf-8") as file:
+        file.write(str(time.time()))
+
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     setup_mode = get_setup_mode()
-
     product_mode = get_product_mode()
 
-    product_mode_labels = {
-        "lite": "Lite",
-        "rider": "Rider",
-        "event": "Event",
-        "facility": "Facility",
-        "pro": "Pro",
-    }
+    if product_mode != "lite":
+        product_mode_labels = {
+            "lite": "Lite",
+            "rider": "Rider",
+            "event": "Event",
+            "facility": "Facility",
+            "pro": "Pro",
+        }
+        product_mode_label = product_mode_labels.get(product_mode, product_mode)
+        pi_temp = get_pi_temperature()
+        pi_temp_text = "-" if pi_temp is None else f"{pi_temp:.1f} ℃"
 
-    product_mode_label = product_mode_labels.get(product_mode, product_mode)
-    is_lite = (product_mode == "lite")
+        return f"""
+        <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Lap Timer</title>
+        <style>body {{ font-family:sans-serif; padding:20px; text-align:center; }} button {{ width:100%; max-width:320px; font-size:24px; padding:18px; margin-top:20px; }}</style>
+        </head><body>
+        <h1>Lap Timer</h1>
+        <p>製品モード: <strong>{product_mode_label}</strong></p>
+        <p>Pi温度: <strong>{pi_temp_text}</strong></p>
+        <p><a href="/entry"><button>レースエントリー</button></a></p>
+        <p><a href="/entries"><button>エントリーリスト</button></a></p>
+        <p><a href="/live"><button>リザルト</button></a></p>
+        </body></html>
+        """
 
-    mode_labels = {
-        "entry": "エントリー受付中",
-        "locked": "エントリー締切",
-        "race": "レース中",
-        "finished": "レース終了",
-    }
+    current_race_id = get_current_race_id()
+    summary = get_lite_summary(current_race_id)
+    active = is_race_active()
 
-    mode_label = mode_labels.get(setup_mode, setup_mode)
-    pi_temp = get_pi_temperature()
-    pi_temp_text = "-" if pi_temp is None else f"{pi_temp:.1f} ℃"
+    if active:
+        lite_state = "running" if summary["has_start"] else "waiting"
+    elif setup_mode == "finished":
+        lite_state = "finished"
+    else:
+        lite_state = "stopped"
 
-    if is_lite:
-        menu_html = """
-        <p>
-            <a href="/lite/result">
-                <button>リザルト</button>
-            </a>
-        </p>
+    refresh_tag = '<meta http-equiv="refresh" content="1">' if lite_state in ("waiting", "running") else ""
 
-        <p>
-            <a href="/admin/rssi-monitor">
-                <button>RSSIモニタ</button>
-            </a>
-        </p>
-
-        <p>
-            <a href="/admin/rssi-settings">
-                <button>RSSI設定</button>
-            </a>
-        </p>
-        <form action="/admin/lite-reset" method="post">
-            <button type="submit">練習リセット</button>
-        </form>
+    if lite_state == "stopped":
+        state_html = """
+        <div class="status">⚪ 計測停止中</div>
+        <p>「スタート」を押してください。</p>
+        <form action="/lite/start" method="post"><button class="start" type="submit">▶ 計測スタート</button></form>
+        <p class="sub-link"><a href="/lite/result">前回のリザルトを見る</a></p>
+        """
+    elif lite_state == "waiting":
+        state_html = """
+        <div class="status">🟡 最初のゲート通過待ち</div>
+        <p>最初にゲートを通過したところからラップ計測を開始します。</p>
+        <form action="/lite/stop" method="post"><button class="stop" type="submit">■ 計測ストップ</button></form>
+        """
+    elif lite_state == "running":
+        state_html = f"""
+        <div class="status">🟢 ラップ計測中</div>
+        <div class="stats">
+          <div><span>実周回数</span><strong>{summary['laps']}</strong></div>
+          <div><span>最新ラップ</span><strong>{format_time(summary['latest_lap'])}</strong></div>
+          <div><span>ベスト</span><strong>{format_time(summary['best_lap'])}</strong></div>
+          <div><span>平均</span><strong>{format_time(summary['avg_lap'])}</strong></div>
+        </div>
+        <form action="/lite/stop" method="post"><button class="stop" type="submit">■ 計測ストップ</button></form>
         """
     else:
-        menu_html = """
-        <p>
-            <a href="/entry">
-                <button>レースエントリー</button>
-            </a>
-        </p>
-
-        <p>
-            <a href="/entries">
-                <button>エントリーリスト</button>
-            </a>
-        </p>
-
-        <p>
-            <a href="/live">
-                <button>リザルト</button>
-            </a>
-        </p>
+        state_html = f"""
+        <div class="status">✅ 計測終了</div>
+        <div class="stats">
+          <div><span>実周回数</span><strong>{summary['laps']}</strong></div>
+          <div><span>ベスト</span><strong>{format_time(summary['best_lap'])}</strong></div>
+          <div><span>平均</span><strong>{format_time(summary['avg_lap'])}</strong></div>
+        </div>
+        <p><a class="result-button" href="/lite/result">リザルトを見る</a></p>
+        <form action="/lite/start" method="post"><button class="start" type="submit">▶ 新しく計測スタート</button></form>
         """
 
     return f"""
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-
-        <title>Lap Timer</title>
-
-        <style>
-            body {{
-                font-family: sans-serif;
-                padding: 20px;
-                text-align: center;
-            }}
-
-            h1 {{
-                margin-bottom: 30px;
-            }}
-
-            button {{
-                width: 100%;
-                max-width: 320px;
-                font-size: 24px;
-                padding: 18px;
-                margin-top: 20px;
-            }}
-        </style>
-    </head>
-
-    <body>
-        <h1>Lap Timer</h1>
-
-        
-        <p>
-            製品モード: <strong>{product_mode_label}</strong>
-        </p>
-        
-        <p>
-            Pi温度: <strong>{pi_temp_text}</strong>
-        </p>
-
-        {menu_html}
-    </body>
-    </html>
+    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh_tag}
+    <title>Lite ラップタイマー</title>
+    <style>
+    body {{ font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif; margin:0; background:#f4f5f7; color:#222; }}
+    .wrap {{ max-width:520px; margin:0 auto; padding:24px 18px 40px; text-align:center; }}
+    h1 {{ font-size:28px; margin:12px 0 28px; }}
+    .card {{ background:white; border-radius:16px; padding:26px 18px; box-shadow:0 2px 10px rgba(0,0,0,.08); }}
+    .status {{ font-size:25px; font-weight:700; margin-bottom:18px; }}
+    .stats {{ margin:22px 0 8px; text-align:left; }}
+    .stats div {{ display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid #eee; padding:12px 4px; gap:16px; }}
+    .stats span {{ font-size:18px; }} .stats strong {{ font-size:25px; font-variant-numeric:tabular-nums; }}
+    button,.result-button {{ box-sizing:border-box; display:inline-block; width:100%; max-width:360px; border:0; border-radius:12px; padding:17px 14px; margin-top:20px; font-size:22px; font-weight:700; text-decoration:none; cursor:pointer; }}
+    button.start {{ background:#1677ff; color:white; }} button.stop {{ background:#333; color:white; }} .result-button {{ background:#e9eef5; color:#222; }}
+    .sub-link {{ margin-top:24px; }} .sub-link a {{ color:#444; }}
+    </style></head><body><div class="wrap"><h1>Lite ラップタイマー</h1><div class="card">{state_html}</div></div></body></html>
     """
+
+
 @app.get("/admin/shutdown", response_class=HTMLResponse)
 def shutdown_confirm():
     return """
@@ -390,34 +435,45 @@ def reset_race():
 
     return RedirectResponse(url="/view", status_code=303)
 
-@app.post("/admin/lite-reset")
-def lite_reset():
+@app.post("/lite/start")
+def lite_start():
     product_mode = get_product_mode()
-
     if product_mode != "lite":
-        return RedirectResponse(url="/admin", status_code=303)
+        return RedirectResponse(url="/", status_code=303)
 
-    backup_db("before_lite_reset")
-
+    backup_db("before_lite_start")
     set_race_active(False)
-    finish_current_race()
+
+    current_race_id = get_current_race_id()
+    if current_race_id is not None:
+        finish_current_race()
 
     create_new_race()
-
     set_setup_mode("race")
+    write_lite_reset_request()
     set_race_active(True)
-
-    backup_db("after_lite_reset")
-    
-    reset_request_path = os.path.join(
-        os.path.dirname(__file__),
-        "lite_reset.request",
-    )
-
-    with open(reset_request_path, "w", encoding="utf-8") as file:
-        file.write(str(time.time()))
-
+    backup_db("after_lite_start")
     return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/lite/stop")
+def lite_stop():
+    product_mode = get_product_mode()
+    if product_mode != "lite":
+        return RedirectResponse(url="/", status_code=303)
+
+    backup_db("before_lite_stop")
+    set_race_active(False)
+    finish_current_race()
+    set_setup_mode("finished")
+    backup_db("after_lite_stop")
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/admin/lite-reset")
+def lite_reset():
+    return lite_start()
+
 
 @app.post("/mode/entry")
 def mode_entry():
@@ -639,7 +695,7 @@ def lite_result():
         </div>
 
         <div class="card">
-            <div>周回数</div>
+            <div>実周回数</div>
             <div class="big">{row["laps"]}</div>
         </div>
 
