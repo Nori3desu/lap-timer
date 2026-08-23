@@ -1392,6 +1392,552 @@ def restart_all_receivers():
 
 
 
+
+
+# ============================================================
+# ゲート診断
+# ============================================================
+
+GATE_DIAGNOSTIC_EVENT_LABELS = {
+    "RESET_WAITING_CLEAR":
+        ("🟠", "リセット後クリア待ち", "event-warning"),
+
+    "MEASUREMENT_READY":
+        ("🟢", "計測準備OK", "event-good"),
+
+    "ENTRY_START":
+        ("🔵", "ENTRY開始", "event-info"),
+
+    "ENTRY_CANCEL":
+        ("⚪", "ENTRYキャンセル", "event-muted"),
+
+    "ENTRY_CONFIRMED":
+        ("✅", "ENTRY成立", "event-good"),
+
+    "LAP_RECORDED":
+        ("🏁", "ラップ記録", "event-lap"),
+
+    "LAP_BLOCKED_MIN_TIME":
+        ("⛔", "最短ラップ時間で除外", "event-danger"),
+
+    "EXIT_START":
+        ("🟡", "EXIT開始", "event-warning"),
+
+    "EXIT_CANCEL":
+        ("↩️", "EXITキャンセル", "event-warning"),
+
+    "EXIT_CONFIRMED":
+        ("✅", "EXIT成立", "event-good"),
+}
+
+
+def get_gate_diagnostic_events(
+    minutes: int = 20,
+    limit: int = 300,
+):
+    minutes = max(
+        1,
+        min(int(minutes), 180),
+    )
+
+    limit = max(
+        1,
+        min(int(limit), 1000),
+    )
+
+    db_path = os.path.join(
+        os.path.dirname(__file__),
+        "lap_timer.db",
+    )
+
+    since = (
+        time.time()
+        - (minutes * 60)
+    )
+
+    conn = sqlite3.connect(
+        db_path,
+        timeout=5.0,
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                id,
+                serial_number,
+                event_type,
+                timestamp,
+                detail
+            FROM gate_state_events
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (
+                since,
+                limit,
+            ),
+        )
+
+        return [
+            dict(row)
+            for row in cur.fetchall()
+        ]
+
+    except sqlite3.OperationalError:
+        return []
+
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/admin/gate-diagnostics",
+    response_class=HTMLResponse,
+)
+def gate_diagnostics(
+    minutes: int = 20,
+):
+    minutes = max(
+        1,
+        min(int(minutes), 180),
+    )
+
+    events = get_gate_diagnostic_events(
+        minutes=minutes,
+        limit=500,
+    )
+
+    # --------------------------------------------------------
+    # 簡易集計
+    # --------------------------------------------------------
+
+    event_counts = {}
+
+    for event in events:
+        event_type = event[
+            "event_type"
+        ]
+
+        event_counts[event_type] = (
+            event_counts.get(
+                event_type,
+                0,
+            )
+            + 1
+        )
+
+    lap_count = event_counts.get(
+        "LAP_RECORDED",
+        0,
+    )
+
+    blocked_count = event_counts.get(
+        "LAP_BLOCKED_MIN_TIME",
+        0,
+    )
+
+    entry_cancel_count = event_counts.get(
+        "ENTRY_CANCEL",
+        0,
+    )
+
+    exit_cancel_count = event_counts.get(
+        "EXIT_CANCEL",
+        0,
+    )
+
+    # --------------------------------------------------------
+    # イベントカード
+    # --------------------------------------------------------
+
+    cards = ""
+
+    for event in events:
+        event_type = str(
+            event["event_type"]
+        )
+
+        timestamp = float(
+            event["timestamp"]
+        )
+
+        serial_number = html.escape(
+            str(
+                event["serial_number"]
+            )
+        )
+
+        detail = html.escape(
+            str(
+                event.get("detail")
+                or ""
+            )
+        )
+
+        icon, label, css_class = (
+            GATE_DIAGNOSTIC_EVENT_LABELS.get(
+                event_type,
+                (
+                    "⚪",
+                    event_type,
+                    "event-muted",
+                ),
+            )
+        )
+
+        time_text = time.strftime(
+            "%H:%M:%S",
+            time.localtime(timestamp),
+        )
+
+        milliseconds = int(
+            (
+                timestamp
+                - int(timestamp)
+            )
+            * 1000
+        )
+
+        time_text = (
+            f"{time_text}."
+            f"{milliseconds:03d}"
+        )
+
+        cards += f"""
+        <div class="event-card {css_class}">
+            <div class="event-top">
+                <div class="event-title">
+                    {icon} {html.escape(label)}
+                </div>
+
+                <div class="event-time">
+                    {time_text}
+                </div>
+            </div>
+
+            <div class="event-tx">
+                {serial_number}
+            </div>
+
+            {
+                f'<div class="event-detail">{detail}</div>'
+                if detail
+                else ''
+            }
+        </div>
+        """
+
+    if not cards:
+        cards = """
+        <div class="empty">
+            この時間帯の診断イベントはありません。
+        </div>
+        """
+
+    return HTMLResponse(
+        f"""
+        <!DOCTYPE html>
+        <html lang="ja">
+        <head>
+            <meta charset="UTF-8">
+
+            <meta
+                name="viewport"
+                content="width=device-width, initial-scale=1"
+            >
+
+            <meta
+                http-equiv="refresh"
+                content="5"
+            >
+
+            <title>ゲート診断</title>
+
+            <style>
+                * {{
+                    box-sizing: border-box;
+                }}
+
+                body {{
+                    margin: 0;
+                    padding: 14px;
+                    background: #f4f5f7;
+                    font-family:
+                        -apple-system,
+                        BlinkMacSystemFont,
+                        "Segoe UI",
+                        sans-serif;
+                    color: #222;
+                }}
+
+                .page {{
+                    max-width: 760px;
+                    margin: 0 auto;
+                }}
+
+                h1 {{
+                    margin:
+                        6px 0 8px 0;
+                    font-size: 26px;
+                }}
+
+                .note {{
+                    background: #fff;
+                    border-radius: 12px;
+                    padding: 12px;
+                    margin-bottom: 12px;
+                    font-size: 14px;
+                    line-height: 1.5;
+                }}
+
+                .summary {{
+                    display: grid;
+                    grid-template-columns:
+                        repeat(2, 1fr);
+                    gap: 8px;
+                    margin-bottom: 12px;
+                }}
+
+                .summary-card {{
+                    background: #fff;
+                    border-radius: 10px;
+                    padding: 11px;
+                    text-align: center;
+                    border: 1px solid #ddd;
+                }}
+
+                .summary-number {{
+                    font-size: 24px;
+                    font-weight: 800;
+                }}
+
+                .summary-label {{
+                    margin-top: 3px;
+                    font-size: 12px;
+                    color: #555;
+                }}
+
+                .range-buttons {{
+                    display: grid;
+                    grid-template-columns:
+                        repeat(3, 1fr);
+                    gap: 7px;
+                    margin-bottom: 14px;
+                }}
+
+                .range-buttons a {{
+                    text-align: center;
+                    text-decoration: none;
+                    color: #222;
+                    background: #fff;
+                    border: 1px solid #bbb;
+                    border-radius: 9px;
+                    padding: 10px 4px;
+                    font-weight: 700;
+                }}
+
+                .event-card {{
+                    background: #fff;
+                    border-radius: 12px;
+                    padding: 12px 13px;
+                    margin-bottom: 8px;
+                    border-left:
+                        6px solid #aaa;
+                    box-shadow:
+                        0 1px 2px
+                        rgba(0,0,0,0.05);
+                }}
+
+                .event-top {{
+                    display: flex;
+                    justify-content:
+                        space-between;
+                    align-items:
+                        flex-start;
+                    gap: 10px;
+                }}
+
+                .event-title {{
+                    font-weight: 800;
+                    font-size: 17px;
+                }}
+
+                .event-time {{
+                    font-family:
+                        ui-monospace,
+                        SFMono-Regular,
+                        Menlo,
+                        monospace;
+                    font-weight: 700;
+                    white-space: nowrap;
+                }}
+
+                .event-tx {{
+                    margin-top: 5px;
+                    font-size: 13px;
+                    color: #555;
+                }}
+
+                .event-detail {{
+                    margin-top: 8px;
+                    padding-top: 8px;
+                    border-top:
+                        1px solid
+                        rgba(0,0,0,0.08);
+                    font-family:
+                        ui-monospace,
+                        SFMono-Regular,
+                        Menlo,
+                        monospace;
+                    font-size: 12px;
+                    line-height: 1.45;
+                    overflow-wrap: anywhere;
+                }}
+
+                .event-good {{
+                    border-left-color: #198754;
+                }}
+
+                .event-lap {{
+                    border-left-color: #0d6efd;
+                    background: #eef5ff;
+                }}
+
+                .event-danger {{
+                    border-left-color: #dc3545;
+                    background: #fff0f1;
+                }}
+
+                .event-warning {{
+                    border-left-color: #ffc107;
+                }}
+
+                .event-info {{
+                    border-left-color: #0dcaf0;
+                }}
+
+                .event-muted {{
+                    border-left-color: #adb5bd;
+                }}
+
+                .empty {{
+                    background: #fff;
+                    border-radius: 12px;
+                    padding: 20px;
+                    text-align: center;
+                }}
+
+                .back {{
+                    display: block;
+                    text-align: center;
+                    text-decoration: none;
+                    margin-top: 18px;
+                    padding: 14px;
+                    background: #333;
+                    color: #fff;
+                    border-radius: 10px;
+                    font-weight: 700;
+                }}
+
+                @media (min-width: 600px) {{
+                    .summary {{
+                        grid-template-columns:
+                            repeat(4, 1fr);
+                    }}
+                }}
+            </style>
+        </head>
+
+        <body>
+            <div class="page">
+
+                <h1>ゲート診断</h1>
+
+                <div class="note">
+                    最新イベントを上に表示しています。
+                    5秒ごとに自動更新します。
+                    <br>
+                    表示範囲：直近
+                    <strong>{minutes}分</strong>
+                </div>
+
+                <div class="summary">
+
+                    <div class="summary-card">
+                        <div class="summary-number">
+                            {lap_count}
+                        </div>
+                        <div class="summary-label">
+                            🏁 ラップ記録
+                        </div>
+                    </div>
+
+                    <div class="summary-card">
+                        <div class="summary-number">
+                            {blocked_count}
+                        </div>
+                        <div class="summary-label">
+                            ⛔ 最短時間除外
+                        </div>
+                    </div>
+
+                    <div class="summary-card">
+                        <div class="summary-number">
+                            {entry_cancel_count}
+                        </div>
+                        <div class="summary-label">
+                            ENTRY取消
+                        </div>
+                    </div>
+
+                    <div class="summary-card">
+                        <div class="summary-number">
+                            {exit_cancel_count}
+                        </div>
+                        <div class="summary-label">
+                            EXIT取消
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="range-buttons">
+                    <a href="/admin/gate-diagnostics?minutes=5">
+                        5分
+                    </a>
+
+                    <a href="/admin/gate-diagnostics?minutes=20">
+                        20分
+                    </a>
+
+                    <a href="/admin/gate-diagnostics?minutes=60">
+                        60分
+                    </a>
+                </div>
+
+                {cards}
+
+                <a
+                    class="back"
+                    href="/admin"
+                >
+                    管理者メニューへ戻る
+                </a>
+
+            </div>
+        </body>
+        </html>
+        """
+    )
+
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin():
     setup_mode = get_setup_mode()
@@ -1756,6 +2302,8 @@ def admin():
         {"<a href='/lite/result' target='_blank'>リザルト</a>" if is_lite else "<a href='/live' target='_blank'>リザルト</a>"}
 
         <a href="/admin/rssi-monitor">RSSIモニタ</a>
+
+        <a href="/admin/gate-diagnostics">🩺 ゲート診断</a>
 
         <a href="/admin/receivers">📡 レシーバー管理</a>
 
