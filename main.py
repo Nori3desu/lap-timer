@@ -1431,6 +1431,350 @@ GATE_DIAGNOSTIC_EVENT_LABELS = {
 }
 
 
+def parse_gate_detail(detail: str):
+    result = {}
+
+    if not detail:
+        return result
+
+    patterns = {
+        "elapsed":
+            r"\belapsed=([0-9.]+)",
+
+        "remaining":
+            r"\bremaining=([0-9.]+)",
+
+        "minimum":
+            r"\bminimum=([0-9.]+)",
+
+        "combined":
+            r"\bcombined=([^\s]+)",
+
+        "fresh_rx":
+            r"\bfresh_rx=([0-9]+)",
+
+        "diff":
+            r"\bdiff=([^\s]+)",
+
+        "lap":
+            r"\blap=([0-9]+)",
+
+        "lap_time":
+            r"\blap_time=([^\s]+)",
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(
+            pattern,
+            detail,
+        )
+
+        if match:
+            result[key] = match.group(1)
+
+    rx_values = {}
+
+    for match in re.finditer(
+        r"'(RX-[0-9]+)':\s*(-?[0-9]+)",
+        detail,
+    ):
+        rx_values[
+            match.group(1)
+        ] = int(
+            match.group(2)
+        )
+
+    result["rx_values"] = rx_values
+
+    return result
+
+
+def gate_event_detail_japanese(
+    event_type: str,
+    detail: str,
+):
+    parsed = parse_gate_detail(
+        detail
+    )
+
+    rx_values = parsed.get(
+        "rx_values",
+        {},
+    )
+
+    rx_text = ""
+
+    if rx_values:
+        rx_text = " / ".join(
+            f"{receiver_id} {rssi} dBm"
+            for receiver_id, rssi
+            in sorted(
+                rx_values.items()
+            )
+        )
+
+    combined = parsed.get(
+        "combined"
+    )
+
+    if event_type == "ENTRY_START":
+        parts = [
+            "ENTRY判定を開始しました。"
+        ]
+
+        if rx_text:
+            parts.append(
+                f"受信：{rx_text}"
+            )
+
+        if combined not in (
+            None,
+            "None",
+        ):
+            parts.append(
+                f"統合RSSI {combined} dBm"
+            )
+
+        return "<br>".join(parts)
+
+    if event_type == "ENTRY_CANCEL":
+        elapsed = parsed.get(
+            "elapsed"
+        )
+
+        parts = [
+            "ENTRY条件を維持できなかったため取消しました。"
+        ]
+
+        if elapsed is not None:
+            parts.append(
+                f"継続時間 {float(elapsed):.3f} 秒"
+            )
+
+        if rx_text:
+            parts.append(
+                f"受信：{rx_text}"
+            )
+
+        return "<br>".join(parts)
+
+    if event_type == "ENTRY_CONFIRMED":
+        elapsed = parsed.get(
+            "elapsed"
+        )
+
+        parts = [
+            "ENTRY成立。ゲート通過として認識しました。"
+        ]
+
+        if elapsed is not None:
+            parts.append(
+                f"ENTRY継続 {float(elapsed):.3f} 秒"
+            )
+
+        if rx_text:
+            parts.append(
+                f"受信：{rx_text}"
+            )
+
+        if combined not in (
+            None,
+            "None",
+        ):
+            parts.append(
+                f"統合RSSI {combined} dBm"
+            )
+
+        return "<br>".join(parts)
+
+    if event_type == "LAP_RECORDED":
+        lap = parsed.get(
+            "lap"
+        )
+
+        lap_time = parsed.get(
+            "lap_time"
+        )
+
+        parts = [
+            "周回を記録しました。"
+        ]
+
+        if lap:
+            parts.append(
+                f"ラップ番号 {lap}"
+            )
+
+        if (
+            lap_time
+            and lap_time != "FIRST"
+        ):
+            try:
+                parts.append(
+                    f"ラップタイム {float(lap_time):.3f} 秒"
+                )
+            except ValueError:
+                pass
+
+        return "<br>".join(parts)
+
+    if event_type == "LAP_BLOCKED_MIN_TIME":
+        elapsed = parsed.get(
+            "elapsed"
+        )
+
+        remaining = parsed.get(
+            "remaining"
+        )
+
+        minimum = parsed.get(
+            "minimum"
+        )
+
+        parts = [
+            "ENTRYは成立しましたが、周回には加算しませんでした。"
+        ]
+
+        if elapsed is not None:
+            parts.append(
+                f"前回ラップから {float(elapsed):.3f} 秒"
+            )
+
+        if minimum is not None:
+            parts.append(
+                f"最短ラップ設定 {float(minimum):.3f} 秒"
+            )
+
+        if remaining is not None:
+            parts.append(
+                f"あと {float(remaining):.3f} 秒不足"
+            )
+
+        return "<br>".join(parts)
+
+    if event_type == "EXIT_START":
+        if rx_values:
+            return (
+                "EXIT判定を開始しました。"
+                f"<br>受信：{rx_text}"
+            )
+
+        return (
+            "RXの有効信号がなくなり、"
+            "EXIT判定を開始しました。"
+        )
+
+    if event_type == "EXIT_CANCEL":
+        parts = [
+            "再び信号を受信したため、EXIT判定を取消しました。"
+        ]
+
+        if rx_text:
+            parts.append(
+                f"受信：{rx_text}"
+            )
+
+        return "<br>".join(parts)
+
+    if event_type == "EXIT_CONFIRMED":
+        return (
+            "EXIT成立。ゲートから十分離れました。"
+            "<br>次の通過を受け付けられます。"
+        )
+
+    if event_type == "RESET_WAITING_CLEAR":
+        return (
+            "リセット後のクリア待ちです。"
+            "<br>TXをゲートから十分離してください。"
+        )
+
+    if event_type == "MEASUREMENT_READY":
+        return (
+            "リセット後のクリア確認が完了しました。"
+            "<br>次の通過から計測できます。"
+        )
+
+    return html.escape(
+        detail
+    )
+
+
+def get_current_gate_status(events):
+    if not events:
+        return (
+            "⚪",
+            "状態不明",
+            "診断イベントがありません。",
+            "#f3f4f6",
+            "#6c757d",
+        )
+
+    latest = events[0]
+
+    event_type = str(
+        latest.get(
+            "event_type",
+            "",
+        )
+    )
+
+    if event_type == "RESET_WAITING_CLEAR":
+        return (
+            "🔴",
+            "リセット後クリア待ち",
+            "TXをゲートから十分離してください。",
+            "#fdecec",
+            "#dc3545",
+        )
+
+    if event_type in (
+        "ENTRY_START",
+    ):
+        return (
+            "🟡",
+            "ENTRY判定中",
+            "現在、ENTRY条件の継続を確認しています。",
+            "#fff7db",
+            "#d39e00",
+        )
+
+    if event_type in (
+        "ENTRY_CONFIRMED",
+        "LAP_RECORDED",
+        "LAP_BLOCKED_MIN_TIME",
+        "EXIT_START",
+        "EXIT_CANCEL",
+    ):
+        return (
+            "🔵",
+            "ゲート内・EXIT待ち",
+            "次の周回を受け付けるにはEXIT成立が必要です。",
+            "#e8f1ff",
+            "#0d6efd",
+        )
+
+    if event_type in (
+        "MEASUREMENT_READY",
+        "ENTRY_CANCEL",
+        "EXIT_CONFIRMED",
+    ):
+        return (
+            "🟢",
+            "計測可能",
+            "次の通過を受け付けられます。",
+            "#e7f6ed",
+            "#198754",
+        )
+
+    return (
+        "⚪",
+        "状態確認中",
+        f"最新イベント：{html.escape(event_type)}",
+        "#f3f4f6",
+        "#6c757d",
+    )
+
+
 def get_gate_diagnostic_events(
     minutes: int = 20,
     limit: int = 300,
@@ -1513,6 +1857,16 @@ def gate_diagnostics(
         limit=500,
     )
 
+    (
+        current_icon,
+        current_title,
+        current_message,
+        current_background,
+        current_border,
+    ) = get_current_gate_status(
+        events
+    )
+
     # --------------------------------------------------------
     # 簡易集計
     # --------------------------------------------------------
@@ -1573,11 +1927,14 @@ def gate_diagnostics(
             )
         )
 
-        detail = html.escape(
-            str(
-                event.get("detail")
-                or ""
-            )
+        raw_detail = str(
+            event.get("detail")
+            or ""
+        )
+
+        detail = gate_event_detail_japanese(
+            event_type,
+            raw_detail,
         )
 
         icon, label, css_class = (
@@ -1694,6 +2051,24 @@ def gate_diagnostics(
                     margin-bottom: 12px;
                     font-size: 14px;
                     line-height: 1.5;
+                }}
+
+                .current-status {{
+                    border-radius: 14px;
+                    padding: 15px;
+                    margin-bottom: 12px;
+                    border: 2px solid;
+                }}
+
+                .current-status-title {{
+                    font-size: 22px;
+                    font-weight: 850;
+                }}
+
+                .current-status-message {{
+                    margin-top: 6px;
+                    font-size: 15px;
+                    line-height: 1.45;
                 }}
 
                 .summary {{
@@ -1865,6 +2240,23 @@ def gate_diagnostics(
                     <br>
                     表示範囲：直近
                     <strong>{minutes}分</strong>
+                </div>
+
+                <div
+                    class="current-status"
+                    style="
+                        background:{current_background};
+                        border-color:{current_border};
+                    "
+                >
+                    <div class="current-status-title">
+                        {current_icon}
+                        {html.escape(current_title)}
+                    </div>
+
+                    <div class="current-status-message">
+                        {html.escape(current_message)}
+                    </div>
                 </div>
 
                 <div class="summary">
