@@ -18,6 +18,7 @@ from ranking import (
 )
 
 from database import (
+    get_connection,
     init_db,
     clear_laps,
     set_race_active,
