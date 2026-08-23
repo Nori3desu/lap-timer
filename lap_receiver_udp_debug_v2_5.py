@@ -703,6 +703,19 @@ def record_lap(
 
         if elapsed < MINIMUM_LAP_SECONDS:
             remaining = MINIMUM_LAP_SECONDS - elapsed
+
+            save_gate_state_event(
+                transmitter=transmitter,
+                event_type="LAP_BLOCKED_MIN_TIME",
+                detail=(
+                    f"elapsed={elapsed:.3f} "
+                    f"remaining={remaining:.3f} "
+                    f"minimum={MINIMUM_LAP_SECONDS:.3f} "
+                    f"combined={combined_rssi} "
+                    f"diff={rssi_difference}"
+                ),
+            )
+
             print()
             print(
                 f"[判定保留] {transmitter.serial_number} "
@@ -717,6 +730,18 @@ def record_lap(
     state.lap_count += 1
     state.last_lap_monotonic = now_monotonic
     state.last_lap_datetime = packet.received_at
+
+    save_gate_state_event(
+        transmitter=transmitter,
+        event_type="LAP_RECORDED",
+        detail=(
+            f"lap={state.lap_count} "
+            f"lap_time="
+            f"{lap_time_seconds if lap_time_seconds is not None else 'FIRST'} "
+            f"combined={combined_rssi} "
+            f"diff={rssi_difference}"
+        ),
+    )
 
     save_detail_lap(
         connection=connection,
@@ -1040,6 +1065,18 @@ def evaluate_gate(
         if entry_signal:
             state.gate_state = GateState.ENTRY_CANDIDATE
             state.entry_candidate_since = now_monotonic
+
+            save_gate_state_event(
+                transmitter=transmitter,
+                event_type="ENTRY_START",
+                detail=(
+                    f"combined={combined_rssi} "
+                    f"fresh_rx={len(fresh_values)} "
+                    f"diff={rssi_difference} "
+                    f"values={fresh_rssi_by_receiver}"
+                ),
+            )
+
             if DEBUG_ENTRY:
                 print()
                 fresh_text = " ".join(
@@ -1070,6 +1107,19 @@ def evaluate_gate(
             if DEBUG_ENTRY:
                 print()
                 print(f"[ダイバーシティENTRYキャンセル] {transmitter.serial_number} 経過={elapsed:.2f}秒")
+
+            save_gate_state_event(
+                transmitter=transmitter,
+                event_type="ENTRY_CANCEL",
+                detail=(
+                    f"elapsed={elapsed:.3f} "
+                    f"combined={combined_rssi} "
+                    f"fresh_rx={len(fresh_values)} "
+                    f"diff={rssi_difference} "
+                    f"values={fresh_rssi_by_receiver}"
+                ),
+            )
+
             state.entry_candidate_since = None
             state.gate_state = GateState.WAIT
             return
@@ -1098,6 +1148,18 @@ def evaluate_gate(
                 f"差={rssi_difference}"
             )
 
+        save_gate_state_event(
+            transmitter=transmitter,
+            event_type="ENTRY_CONFIRMED",
+            detail=(
+                f"elapsed={entry_elapsed:.3f} "
+                f"combined={combined_rssi} "
+                f"fresh_rx={len(fresh_values)} "
+                f"diff={rssi_difference} "
+                f"values={fresh_rssi_by_receiver}"
+            ),
+        )
+
         state.entry_candidate_since = None
         state.gate_state = GateState.INSIDE
         record_lap(
@@ -1114,12 +1176,36 @@ def evaluate_gate(
         if all_receivers_exit_ready:
             state.gate_state = GateState.EXIT_CANDIDATE
             state.exit_candidate_since = now_monotonic
+
+            save_gate_state_event(
+                transmitter=transmitter,
+                event_type="EXIT_START",
+                detail=(
+                    f"combined={combined_rssi} "
+                    f"fresh_rx={len(fresh_values)} "
+                    f"diff={rssi_difference} "
+                    f"values={fresh_rssi_by_receiver}"
+                ),
+            )
+
             print()
             print(f"[ダイバーシティEXIT候補] {transmitter.serial_number}")
         return
 
     if state.gate_state == GateState.EXIT_CANDIDATE:
         if not all_receivers_exit_ready:
+
+            save_gate_state_event(
+                transmitter=transmitter,
+                event_type="EXIT_CANCEL",
+                detail=(
+                    f"combined={combined_rssi} "
+                    f"fresh_rx={len(fresh_values)} "
+                    f"diff={rssi_difference} "
+                    f"values={fresh_rssi_by_receiver}"
+                ),
+            )
+
             state.exit_candidate_since = None
             state.gate_state = GateState.INSIDE
             print()
@@ -1135,6 +1221,17 @@ def evaluate_gate(
             state.dense_log_until_monotonic = (
                 now_monotonic
                 + RSSI_DENSE_POST_EXIT_SECONDS
+            )
+
+            save_gate_state_event(
+                transmitter=transmitter,
+                event_type="EXIT_CONFIRMED",
+                detail=(
+                    f"combined={combined_rssi} "
+                    f"fresh_rx={len(fresh_values)} "
+                    f"diff={rssi_difference} "
+                    f"values={fresh_rssi_by_receiver}"
+                ),
             )
 
             state.gate_state = GateState.WAIT
