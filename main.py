@@ -378,7 +378,7 @@ def root():
         <div class="status">⚪ 計測停止中</div>
         <p>「スタート」を押してください。</p>
         <form action="/lite/start" method="post"><button class="start" type="submit">▶ 計測スタート</button></form>
-        <p class="sub-link"><a href="/lite/result">前回のリザルトを見る</a></p>
+        <p class="sub-link"><a href="/lite/result">過去の計測結果</a></p>
         """
     elif lite_state == "waiting":
         state_html = """
@@ -748,65 +748,251 @@ def get_major_rankings_by_race(race_id):
     conn.close()
     return result
 
+
+def get_lite_race_history():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    rows = cur.execute(
+        """
+        SELECT
+            r.id,
+            r.name,
+            r.started_at,
+            r.finished_at,
+            COUNT(
+                CASE
+                    WHEN l.lap_number > 0 AND l.lap_time > 0
+                    THEN 1
+                END
+            ) AS laps,
+            MIN(
+                CASE
+                    WHEN l.lap_number > 0 AND l.lap_time > 0
+                    THEN l.lap_time
+                END
+            ) AS best_lap,
+            AVG(
+                CASE
+                    WHEN l.lap_number > 0 AND l.lap_time > 0
+                    THEN l.lap_time
+                END
+            ) AS avg_lap
+        FROM races r
+        LEFT JOIN laps l
+            ON l.race_id = r.id
+        GROUP BY
+            r.id,
+            r.name,
+            r.started_at,
+            r.finished_at
+        ORDER BY r.id DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def get_lite_race_detail(race_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    race = cur.execute(
+        """
+        SELECT
+            id,
+            name,
+            started_at,
+            finished_at
+        FROM races
+        WHERE id = ?
+        """,
+        (race_id,),
+    ).fetchone()
+
+    if race is None:
+        conn.close()
+        return None
+
+    summary = cur.execute(
+        """
+        SELECT
+            COUNT(*) AS laps,
+            MIN(lap_time) AS best_lap,
+            AVG(lap_time) AS avg_lap
+        FROM laps
+        WHERE race_id = ?
+          AND lap_number > 0
+          AND lap_time > 0
+        """,
+        (race_id,),
+    ).fetchone()
+
+    laps = cur.execute(
+        """
+        SELECT
+            lap_number,
+            lap_time,
+            timestamp
+        FROM laps
+        WHERE race_id = ?
+          AND lap_number > 0
+          AND lap_time > 0
+        ORDER BY lap_number ASC
+        """,
+        (race_id,),
+    ).fetchall()
+
+    conn.close()
+
+    return {
+        "race": dict(race),
+        "summary": dict(summary),
+        "laps": [dict(row) for row in laps],
+    }
+
+
+def format_lite_datetime(value):
+    if value is None:
+        return "-"
+
+    try:
+        return time.strftime(
+            "%Y年%m月%d日 %H:%M",
+            time.localtime(float(value)),
+        )
+    except Exception:
+        return "-"
+
+
 @app.get("/lite/result", response_class=HTMLResponse)
 def lite_result():
-    current_race_id = get_current_race_id()
-
-    if current_race_id is None:
-        rows = []
-    else:
-        rows = get_overall_ranking_by_race(current_race_id)
+    races = get_lite_race_history()
 
     html_text = """
     <html>
     <head>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta http-equiv="refresh" content="2">
-        <title>Lite リザルト</title>
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+
+        <title>過去の計測結果</title>
+
         <style>
-            body { font-family: sans-serif; padding: 16px; text-align: center; }
-            .card { background:#f5f5f5; padding:16px; margin:12px 0; border-radius:8px; }
-            .big { font-size: 32px; font-weight: bold; }
-            button { width:100%; font-size:22px; padding:16px; margin-top:16px; }
+            body {
+                font-family: sans-serif;
+                max-width: 520px;
+                margin: 0 auto;
+                padding: 18px;
+                background: #ffffff;
+                color: #111;
+            }
+
+            h1 {
+                text-align: center;
+                font-size: 26px;
+                margin-bottom: 24px;
+            }
+
+            .back {
+                display: inline-block;
+                margin-bottom: 14px;
+                color: #333;
+            }
+
+            .race-card {
+                background: #f5f5f5;
+                border-radius: 14px;
+                padding: 18px;
+                margin-bottom: 16px;
+            }
+
+            .date {
+                font-size: 19px;
+                font-weight: 700;
+                margin-bottom: 12px;
+            }
+
+            .summary-row {
+                display: flex;
+                justify-content: space-between;
+                padding: 5px 0;
+                font-size: 17px;
+            }
+
+            .detail-button {
+                display: block;
+                margin-top: 15px;
+                padding: 13px;
+                border-radius: 10px;
+                background: #1677ff;
+                color: white;
+                text-align: center;
+                text-decoration: none;
+                font-size: 18px;
+                font-weight: 700;
+            }
+
+            .empty {
+                background: #f5f5f5;
+                border-radius: 14px;
+                padding: 24px;
+                text-align: center;
+            }
         </style>
     </head>
-    <body>
-        <a href="/">← 戻る</a>
 
-        <h1>Lite リザルト</h1>
+    <body>
+        <a class="back" href="/">← Liteに戻る</a>
+
+        <h1>過去の計測結果</h1>
     """
 
-    if not rows:
+    visible_races = [
+        race for race in races
+        if int(race["laps"] or 0) > 0
+    ]
+
+    if not visible_races:
         html_text += """
-        <div class="card">
-            <p>まだラップがありません。</p>
+        <div class="empty">
+            まだ保存された計測結果がありません。
         </div>
         """
+
     else:
-        row = rows[0]
+        for race in visible_races:
+            html_text += f"""
+            <div class="race-card">
 
-        html_text += f"""
-        <div class="card">
-            <div>名前</div>
-            <div class="big">{html.escape(row["name"])}</div>
-        </div>
+                <div class="date">
+                    {format_lite_datetime(race["started_at"])}
+                </div>
 
-        <div class="card">
-            <div>実周回数</div>
-            <div class="big">{row["laps"]}</div>
-        </div>
+                <div class="summary-row">
+                    <span>実周回数</span>
+                    <strong>{int(race["laps"] or 0)}</strong>
+                </div>
 
-        <div class="card">
-            <div>ベストラップ</div>
-            <div class="big">{format_time(row["best_lap"])}</div>
-        </div>
+                <div class="summary-row">
+                    <span>BEST</span>
+                    <strong>{format_time(race["best_lap"])}</strong>
+                </div>
 
-        <div class="card">
-            <div>平均ラップ</div>
-            <div class="big">{format_time(row["avg_lap"])}</div>
-        </div>
-        """
+                <div class="summary-row">
+                    <span>平均</span>
+                    <strong>{format_time(race["avg_lap"])}</strong>
+                </div>
+
+                <a class="detail-button"
+                   href="/lite/result/{race["id"]}">
+                    詳細を見る
+                </a>
+
+            </div>
+            """
 
     html_text += """
     </body>
@@ -814,6 +1000,183 @@ def lite_result():
     """
 
     return html_text
+
+
+@app.get(
+    "/lite/result/{race_id}",
+    response_class=HTMLResponse,
+)
+def lite_result_detail(race_id: int):
+    detail = get_lite_race_detail(race_id)
+
+    if detail is None:
+        return """
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1">
+        </head>
+        <body>
+            <p>指定された計測結果が見つかりません。</p>
+            <p><a href="/lite/result">← 過去の計測結果へ戻る</a></p>
+        </body>
+        </html>
+        """
+
+    race = detail["race"]
+    summary = detail["summary"]
+    laps = detail["laps"]
+
+    best_lap = summary["best_lap"]
+
+    lap_rows = ""
+
+    for lap in laps:
+        is_best = (
+            best_lap is not None
+            and abs(float(lap["lap_time"]) - float(best_lap)) < 0.001
+        )
+
+        best_html = (
+            '<span class="best-mark">BEST</span>'
+            if is_best
+            else ""
+        )
+
+        lap_rows += f"""
+        <div class="lap-row">
+            <span>{lap["lap_number"]}周目</span>
+            <strong>{format_time(lap["lap_time"])}</strong>
+            {best_html}
+        </div>
+        """
+
+    html_text = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+
+        <title>Lite 計測詳細</title>
+
+        <style>
+            body {{
+                font-family: sans-serif;
+                max-width: 520px;
+                margin: 0 auto;
+                padding: 18px;
+                color: #111;
+            }}
+
+            h1 {{
+                text-align: center;
+                font-size: 25px;
+            }}
+
+            .date {{
+                text-align: center;
+                font-size: 18px;
+                margin-bottom: 20px;
+            }}
+
+            .summary {{
+                background: #f5f5f5;
+                padding: 17px;
+                border-radius: 14px;
+            }}
+
+            .summary-row {{
+                display: flex;
+                justify-content: space-between;
+                padding: 6px 0;
+                font-size: 18px;
+            }}
+
+            .history {{
+                margin-top: 22px;
+                background: #f5f5f5;
+                padding: 17px;
+                border-radius: 14px;
+            }}
+
+            .history-title {{
+                font-size: 19px;
+                font-weight: 700;
+                margin-bottom: 10px;
+            }}
+
+            .lap-row {{
+                display: grid;
+                grid-template-columns: 75px 1fr 55px;
+                align-items: center;
+                padding: 6px 0;
+                font-variant-numeric: tabular-nums;
+            }}
+
+            .lap-row strong {{
+                font-size: 18px;
+            }}
+
+            .best-mark {{
+                font-size: 13px;
+                font-weight: 700;
+            }}
+
+            .back {{
+                display: inline-block;
+                margin-bottom: 14px;
+                color: #333;
+            }}
+        </style>
+    </head>
+
+    <body>
+
+        <a class="back" href="/lite/result">
+            ← 過去の計測結果へ戻る
+        </a>
+
+        <h1>計測結果</h1>
+
+        <div class="date">
+            {format_lite_datetime(race["started_at"])}
+        </div>
+
+        <div class="summary">
+
+            <div class="summary-row">
+                <span>実周回数</span>
+                <strong>{int(summary["laps"] or 0)}</strong>
+            </div>
+
+            <div class="summary-row">
+                <span>BEST</span>
+                <strong>{format_time(summary["best_lap"])}</strong>
+            </div>
+
+            <div class="summary-row">
+                <span>平均</span>
+                <strong>{format_time(summary["avg_lap"])}</strong>
+            </div>
+
+        </div>
+
+        <div class="history">
+            <div class="history-title">
+                ラップ履歴
+            </div>
+
+            {lap_rows}
+        </div>
+
+    </body>
+    </html>
+    """
+
+    return html_text
+
 
 @app.get("/live", response_class=HTMLResponse)
 def view(my_minor: int | None = None):
