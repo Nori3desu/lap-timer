@@ -57,6 +57,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         status TEXT NOT NULL,
+        race_type TEXT NOT NULL DEFAULT 'legacy',
         started_at REAL,
         finished_at REAL,
         created_at REAL NOT NULL
@@ -74,6 +75,15 @@ def init_db():
         timestamp REAL NOT NULL
     )
     """)
+
+
+    try:
+        cur.execute("""
+        ALTER TABLE races
+        ADD COLUMN race_type TEXT NOT NULL DEFAULT 'legacy'
+        """)
+    except Exception:
+        pass
 
     try:
         cur.execute("""
@@ -575,7 +585,7 @@ def save_rssi_settings(
     set_setting("cooldown_sec", cooldown_sec)
     set_setting("min_lap_time_sec", min_lap_time_sec)
 
-def create_new_race():
+def create_new_race(race_type="race"):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -586,14 +596,16 @@ def create_new_race():
     INSERT INTO races (
         name,
         status,
+        race_type,
         started_at,
         finished_at,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
     """, (
         race_name,
         "race",
+        race_type,
         now,
         None,
         now

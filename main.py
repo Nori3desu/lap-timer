@@ -547,7 +547,7 @@ def lite_start():
     if current_race_id is not None:
         finish_current_race()
 
-    create_new_race()
+    create_new_race(race_type="lite")
     set_setup_mode("race")
     write_lite_reset_request()
     set_race_active(True)
@@ -591,7 +591,7 @@ def mode_locked():
 def mode_race():
     backup_db("before_race_start")
 
-    create_new_race()
+    create_new_race(race_type="race")
     set_setup_mode("race")
     set_race_active(True)
 
@@ -782,6 +782,7 @@ def get_lite_race_history():
         FROM races r
         LEFT JOIN laps l
             ON l.race_id = r.id
+        WHERE r.race_type = 'lite'
         GROUP BY
             r.id,
             r.name,
@@ -809,6 +810,7 @@ def get_lite_race_detail(race_id):
             finished_at
         FROM races
         WHERE id = ?
+          AND race_type = 'lite'
         """,
         (race_id,),
     ).fetchone()
@@ -853,6 +855,86 @@ def get_lite_race_detail(race_id):
         "summary": dict(summary),
         "laps": [dict(row) for row in laps],
     }
+
+
+
+def delete_lite_race(race_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            DELETE FROM laps
+            WHERE race_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM races
+                  WHERE races.id = ?
+                    AND races.race_type = 'lite'
+              )
+            """,
+            (race_id, race_id),
+        )
+
+        cur.execute(
+            """
+            DELETE FROM races
+            WHERE id = ?
+              AND race_type = 'lite'
+            """,
+            (race_id,),
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+def delete_all_lite_races():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        race_rows = cur.execute(
+            """
+            SELECT id
+            FROM races
+            WHERE race_type = 'lite'
+            """
+        ).fetchall()
+
+        race_ids = [
+            int(row["id"])
+            for row in race_rows
+        ]
+
+        for race_id in race_ids:
+            cur.execute(
+                "DELETE FROM laps WHERE race_id = ?",
+                (race_id,),
+            )
+
+        cur.execute(
+            """
+            DELETE FROM races
+            WHERE race_type = 'lite'
+            """
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 def format_lite_datetime(value):
@@ -994,6 +1076,27 @@ def lite_result():
 
             </div>
             """
+
+    if visible_races:
+        html_text += """
+        <a
+            href="/lite/results/delete-all"
+            style="
+                display:block;
+                margin-top:32px;
+                margin-bottom:30px;
+                padding:14px;
+                border:2px solid #d33;
+                border-radius:10px;
+                color:#d33;
+                text-align:center;
+                text-decoration:none;
+                font-weight:700;
+            "
+        >
+            すべての計測結果を削除
+        </a>
+        """
 
     html_text += """
     </body>
@@ -1172,11 +1275,309 @@ def lite_result_detail(race_id: int):
             {lap_rows}
         </div>
 
+        <a
+            href="/lite/result/{race_id}/delete"
+            style="
+                display:block;
+                margin-top:28px;
+                padding:14px;
+                border:2px solid #d33;
+                border-radius:10px;
+                color:#d33;
+                text-align:center;
+                text-decoration:none;
+                font-weight:700;
+            "
+        >
+            この計測結果を削除
+        </a>
+
     </body>
     </html>
     """
 
     return html_text
+
+
+
+@app.get(
+    "/lite/result/{race_id}/delete",
+    response_class=HTMLResponse,
+)
+def lite_delete_result_confirm(race_id: int):
+    detail = get_lite_race_detail(race_id)
+
+    if detail is None:
+        return RedirectResponse(
+            url="/lite/result",
+            status_code=303,
+        )
+
+    race = detail["race"]
+    summary = detail["summary"]
+
+    return f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
+        <title>計測結果を削除</title>
+
+        <style>
+            body {{
+                font-family: sans-serif;
+                max-width: 520px;
+                margin: 0 auto;
+                padding: 24px 18px;
+                color: #111;
+            }}
+
+            h1 {{
+                text-align: center;
+                font-size: 25px;
+                margin-bottom: 28px;
+            }}
+
+            .box {{
+                background: #f5f5f5;
+                border-radius: 14px;
+                padding: 20px;
+            }}
+
+            .warning {{
+                font-size: 18px;
+                font-weight: 700;
+                line-height: 1.6;
+                margin-bottom: 20px;
+            }}
+
+            .row {{
+                display: flex;
+                justify-content: space-between;
+                padding: 6px 0;
+            }}
+
+            button {{
+                width: 100%;
+                margin-top: 24px;
+                padding: 15px;
+                border: 0;
+                border-radius: 10px;
+                background: #d33;
+                color: white;
+                font-size: 18px;
+                font-weight: 700;
+            }}
+
+            .cancel {{
+                display: block;
+                margin-top: 14px;
+                padding: 14px;
+                text-align: center;
+                color: #333;
+            }}
+        </style>
+    </head>
+
+    <body>
+
+        <h1>計測結果を削除</h1>
+
+        <div class="box">
+
+            <div class="warning">
+                この計測結果を削除しますか？<br>
+                削除したデータは元に戻せません。
+            </div>
+
+            <div class="row">
+                <span>計測日時</span>
+                <strong>
+                    {format_lite_datetime(race["started_at"])}
+                </strong>
+            </div>
+
+            <div class="row">
+                <span>実周回数</span>
+                <strong>
+                    {int(summary["laps"] or 0)}
+                </strong>
+            </div>
+
+            <div class="row">
+                <span>BEST</span>
+                <strong>
+                    {format_time(summary["best_lap"])}
+                </strong>
+            </div>
+
+            <form
+                method="post"
+                action="/lite/result/{race_id}/delete"
+            >
+                <button type="submit">
+                    削除する
+                </button>
+            </form>
+
+            <a
+                class="cancel"
+                href="/lite/result/{race_id}"
+            >
+                キャンセル
+            </a>
+
+        </div>
+
+    </body>
+    </html>
+    """
+
+
+@app.post("/lite/result/{race_id}/delete")
+def lite_delete_result(race_id: int):
+
+    if is_race_active():
+        return RedirectResponse(
+            url="/lite/result",
+            status_code=303,
+        )
+
+    backup_db("before_lite_result_delete")
+
+    delete_lite_race(race_id)
+
+    backup_db("after_lite_result_delete")
+
+    return RedirectResponse(
+        url="/lite/result",
+        status_code=303,
+    )
+
+
+@app.get(
+    "/lite/results/delete-all",
+    response_class=HTMLResponse,
+)
+def lite_delete_all_confirm():
+
+    return """
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1"
+        >
+        <title>すべての計測結果を削除</title>
+
+        <style>
+            body {
+                font-family: sans-serif;
+                max-width: 520px;
+                margin: 0 auto;
+                padding: 24px 18px;
+                color: #111;
+            }
+
+            h1 {
+                text-align: center;
+                font-size: 25px;
+            }
+
+            .box {
+                background: #f5f5f5;
+                border-radius: 14px;
+                padding: 20px;
+                margin-top: 28px;
+            }
+
+            .warning {
+                font-size: 18px;
+                font-weight: 700;
+                line-height: 1.7;
+            }
+
+            button {
+                width: 100%;
+                margin-top: 24px;
+                padding: 15px;
+                border: 0;
+                border-radius: 10px;
+                background: #d33;
+                color: white;
+                font-size: 18px;
+                font-weight: 700;
+            }
+
+            .cancel {
+                display: block;
+                margin-top: 14px;
+                padding: 14px;
+                text-align: center;
+                color: #333;
+            }
+        </style>
+    </head>
+
+    <body>
+
+        <h1>すべて削除</h1>
+
+        <div class="box">
+
+            <div class="warning">
+                保存されているすべての計測結果を
+                削除します。<br><br>
+
+                この操作は元に戻せません。
+            </div>
+
+            <form
+                method="post"
+                action="/lite/results/delete-all"
+            >
+                <button type="submit">
+                    すべて削除する
+                </button>
+            </form>
+
+            <a
+                class="cancel"
+                href="/lite/result"
+            >
+                キャンセル
+            </a>
+
+        </div>
+
+    </body>
+    </html>
+    """
+
+
+@app.post("/lite/results/delete-all")
+def lite_delete_all():
+
+    if is_race_active():
+        return RedirectResponse(
+            url="/lite/result",
+            status_code=303,
+        )
+
+    backup_db("before_lite_delete_all")
+
+    delete_all_lite_races()
+
+    backup_db("after_lite_delete_all")
+
+    return RedirectResponse(
+        url="/lite/result",
+        status_code=303,
+    )
 
 
 @app.get("/live", response_class=HTMLResponse)
