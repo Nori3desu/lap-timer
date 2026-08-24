@@ -379,12 +379,12 @@ def root():
         <div class="status">⚪ 計測停止中</div>
         <p>「スタート」を押してください。</p>
         <form action="/lite/start" method="post"><button class="start" type="submit">▶ 計測スタート</button></form>
-        <p class="sub-link"><a href="/lite/result">過去の計測結果</a></p>
+        <p><a class="result-button" href="/lite/result">過去の計測結果</a></p>
         """
     elif lite_state == "waiting":
         state_html = """
         <div class="status">🟡 最初のゲート通過待ち</div>
-        <p>最初にゲートを通過したところからラップ計測を開始します。</p>
+        <p>最初のゲート通過をスタートとして、ラップ計測を開始します。</p>
         <form action="/lite/stop" method="post"><button class="stop" type="submit">■ 計測ストップ</button></form>
         """
     elif lite_state == "running":
@@ -408,7 +408,7 @@ def root():
           <div><span>平均</span><strong>{format_time(summary['avg_lap'])}</strong></div>
         </div>
         {lap_history_html}
-        <p><a class="result-button" href="/lite/result">リザルトを見る</a></p>
+        <p><a class="result-button" href="/lite/result">過去の履歴を見る</a></p>
         <form action="/lite/start" method="post"><button class="start" type="submit">▶ 新しく計測スタート</button></form>
         """
 
