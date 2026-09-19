@@ -17,6 +17,19 @@ from ranking import (
     get_major_rankings,
 )
 
+# Active receiver list shared with the UDP receiver via environment variable.
+# Default is the three receivers used for current field testing.
+ACTIVE_RECEIVER_IDS = tuple(
+    sorted({
+        item.strip().upper()
+        for item in os.getenv(
+            "SGS_ACTIVE_RECEIVERS",
+            "RX-0001,RX-0002,RX-0003",
+        ).split(",")
+        if item.strip()
+    })
+)
+
 from database import (
     get_connection,
     init_db,
@@ -4528,58 +4541,56 @@ def rssi_monitor():
 
             health_class = "health-ok"
             health_title = "✓ 受信状態 正常"
-            health_detail = "RX-0001 / RX-0002 とも受信しています"
 
-            rx1_health = receiver_health.get("RX-0001")
-            rx2_health = receiver_health.get("RX-0002")
+            health_items = []
+            for receiver_id in ACTIVE_RECEIVER_IDS:
+                h = receiver_health.get(receiver_id)
+                if h is None:
+                    health_items.append((receiver_id, 0, 999999))
+                else:
+                    health_items.append((receiver_id, h["count"], h["age"]))
 
-            if rx1_health and rx2_health:
-                c1 = rx1_health["count"]
-                c2 = rx2_health["count"]
-                a1 = rx1_health["age"]
-                a2 = rx2_health["age"]
+            counts = [item[1] for item in health_items]
+            max_count = max(counts, default=0)
+            positive_counts = [count for count in counts if count > 0]
+            min_positive = min(positive_counts, default=0)
 
-                max_count = max(c1, c2)
-                min_count = min(c1, c2)
+            stopped = [
+                receiver_id
+                for receiver_id, count, age in health_items
+                if age > 10 and max_count >= 8
+            ]
 
-                weak_rx = "RX-0001" if c1 < c2 else "RX-0002"
+            weak = []
+            if max_count >= 8:
+                weak = [
+                    receiver_id
+                    for receiver_id, count, age in health_items
+                    if count / max_count < 0.30
+                ]
 
-                ratio = (
-                    min_count / max_count
-                    if max_count > 0
-                    else 1.0
-                )
+            count_text = " / ".join(
+                f"{receiver_id} {count}件"
+                for receiver_id, count, _ in health_items
+            )
 
-                if (
-                    (a1 > 10 and a2 <= 3)
-                    or (a2 > 10 and a1 <= 3)
+            if stopped:
+                health_class = "health-danger"
+                health_title = "⚠ " + ", ".join(stopped) + " 受信停止の可能性"
+                health_detail = f"直近30秒: {count_text}　再起動を確認してください"
+            elif weak:
+                worst_ratio = (min_positive / max_count) if max_count > 0 else 1.0
+                if worst_ratio < 0.10 or any(
+                    count == 0 for _, count, _ in health_items
                 ):
                     health_class = "health-danger"
-                    health_title = f"⚠ {weak_rx} 受信停止の可能性"
-                    health_detail = "レシーバーの再起動を確認してください"
-
-                elif max_count >= 8 and ratio < 0.10:
-                    health_class = "health-danger"
-                    health_title = f"⚠ {weak_rx} 受信異常の可能性"
-                    health_detail = (
-                        f"直近30秒: RX-0001 {c1}件 / "
-                        f"RX-0002 {c2}件　"
-                        "再起動を確認してください"
-                    )
-
-                elif max_count >= 8 and ratio < 0.30:
-                    health_class = "health-warning"
-                    health_title = f"△ {weak_rx} 受信頻度が低下"
-                    health_detail = (
-                        f"直近30秒: RX-0001 {c1}件 / "
-                        f"RX-0002 {c2}件"
-                    )
-
+                    health_title = "⚠ " + ", ".join(weak) + " 受信異常の可能性"
                 else:
-                    health_detail = (
-                        f"直近30秒: RX-0001 {c1}件 / "
-                        f"RX-0002 {c2}件"
-                    )
+                    health_class = "health-warning"
+                    health_title = "△ " + ", ".join(weak) + " 受信頻度が低下"
+                health_detail = f"直近30秒: {count_text}"
+            else:
+                health_detail = f"直近30秒: {count_text}"
 
             html_text += f"""
             <section class="device-card">

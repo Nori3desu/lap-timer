@@ -21,6 +21,7 @@ UDP Lap Receiver Version 2.5
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sqlite3
 import time
@@ -46,7 +47,16 @@ UDP_BIND_ADDRESS = "0.0.0.0"
 UDP_PORT = 5000
 UDP_BUFFER_SIZE = 1024
 
-ACTIVE_RECEIVER_IDS = {"RX-0001", "RX-0002"}
+# Comma-separated list can be overridden without editing this file.
+# Example: SGS_ACTIVE_RECEIVERS=RX-0001,RX-0002,RX-0003,RX-0004
+ACTIVE_RECEIVER_IDS = {
+    item.strip().upper()
+    for item in os.getenv(
+        "SGS_ACTIVE_RECEIVERS",
+        "RX-0001,RX-0002,RX-0003",
+    ).split(",")
+    if item.strip()
+}
 
 
 # ============================================================
@@ -64,6 +74,7 @@ RECEIVER_DATA_TIMEOUT_SECONDS = 0.60
 
 ENTRY_CONFIRM_SECONDS = 0.12
 EXIT_CONFIRM_SECONDS = 1.0
+REENTRY_LOCK_SECONDS = 10.0
 
 DEBUG_ENTRY = True
 
@@ -179,6 +190,16 @@ REGISTERED_TRANSMITTERS = [
         rider_name="河村",
         bike_name="YZ250FX",
     ),
+    RegisteredTransmitter(
+        serial_number="TX-0004",
+        udp_transmitter_id="TX-EA9BD9",
+        mac_address="5E:D8:AA:EA:9B:D9",
+        uuid="12345678-1234-1234-1234-123456789abc",
+        major=1,
+        minor=1,
+        rider_name="テスト",
+        bike_name="テスト車両",
+    ),
 ]
 
 TRANSMITTER_BY_UDP_ID = {
@@ -259,6 +280,7 @@ class TransmitterState:
     waiting_for_clear_after_reset: bool = False
     entry_candidate_since: float | None = None
     exit_candidate_since: float | None = None
+    reentry_lock_until_monotonic: float = 0.0
 
     last_gate_valid: bool = False
     last_combined_rssi: int | None = None
@@ -823,6 +845,14 @@ def update_receiver_state(
     now_monotonic = time.monotonic()
 
     receiver_state = state.receiver_states[packet.receiver_id]
+
+    if (
+        receiver_state.last_packet_monotonic > 0.0
+        and now_monotonic - receiver_state.last_packet_monotonic
+        > RECEIVER_DATA_TIMEOUT_SECONDS
+    ):
+        receiver_state.rssi_samples.clear()
+
     receiver_state.rssi = packet.rssi
     receiver_state.rssi_samples.append(packet.rssi)
     receiver_state.last_packet_monotonic = now_monotonic
@@ -1063,6 +1093,9 @@ def evaluate_gate(
         return
 
     if state.gate_state == GateState.WAIT:
+        if now_monotonic < state.reentry_lock_until_monotonic:
+            return
+
         if entry_signal:
             state.gate_state = GateState.ENTRY_CANDIDATE
             state.entry_candidate_since = now_monotonic
@@ -1235,6 +1268,9 @@ def evaluate_gate(
                 ),
             )
 
+            state.reentry_lock_until_monotonic = (
+                now_monotonic + REENTRY_LOCK_SECONDS
+            )
             state.gate_state = GateState.WAIT
             print()
             print(f"[ダイバーシティゾーン離脱] {transmitter.serial_number}")
@@ -1285,6 +1321,7 @@ def process_lite_reset_request(
         state.waiting_for_clear_after_reset = True
         state.entry_candidate_since = None
         state.exit_candidate_since = None
+        state.reentry_lock_until_monotonic = 0.0
         state.last_gate_valid = False
         state.last_combined_rssi = None
         state.last_rssi_difference = None
@@ -1328,14 +1365,15 @@ def print_status() -> None:
 
     for transmitter in REGISTERED_TRANSMITTERS:
         state = transmitter_states[transmitter.serial_number]
-        rx1_rssi = state.receiver_states["RX-0001"].averaged_rssi
-        rx2_rssi = state.receiver_states["RX-0002"].averaged_rssi
+        rx_status = " ".join(
+            f"{receiver_id}={str(state.receiver_states[receiver_id].averaged_rssi):>4}"
+            for receiver_id in sorted(ACTIVE_RECEIVER_IDS)
+        )
 
         print(
             f"{transmitter.serial_number:<12}: "
             f"lap={state.lap_count:<3} "
-            f"rx1={str(rx1_rssi):>4} "
-            f"rx2={str(rx2_rssi):>4} "
+            f"{rx_status} "
             f"diff={str(state.last_rssi_difference):>4} "
             f"gate={'OK' if state.last_gate_valid else 'NG'} "
             f"state={state.gate_state.name}"
@@ -1501,7 +1539,7 @@ class SgsUdpProtocol(asyncio.DatagramProtocol):
             "[UDP] Active receivers: "
             + ", ".join(sorted(ACTIVE_RECEIVER_IDS))
         )
-        print("[GATE] Diversity mode: RX-0001 OR RX-0002")
+        print("[GATE] Diversity mode: " + " OR ".join(sorted(ACTIVE_RECEIVER_IDS)))
         print("[GATE] Parallel-course rejection: disabled")
         print(f"[GATE] RSSI moving average: {RSSI_MOVING_AVERAGE_SAMPLES} samples")
         print("[UDP] Waiting for packets...")
