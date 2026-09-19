@@ -66,6 +66,9 @@ app = FastAPI()
 def startup():
     init_db()
 
+    # Pi/Web起動時は検証用RSSIログ保存を必ずOFFから開始する。
+    set_rssi_logging_enabled(False)
+
     product_mode = get_product_mode()
 
     # LiteはWebサービス起動時に自動計測しない。
@@ -342,6 +345,35 @@ def write_lite_reset_request():
         file.write(str(time.time()))
 
 
+def set_rssi_logging_enabled(enabled: bool) -> None:
+    """検証用RSSIログ保存のON/OFF。ラップ計測とは独立。"""
+    db_path = os.path.join(os.path.dirname(__file__), "lap_timer.db")
+    connection = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        connection.execute(
+            """INSERT INTO settings (key, value)
+               VALUES ('rssi_logging_enabled', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            ("1" if enabled else "0",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def is_rssi_logging_enabled() -> bool:
+    """検証用RSSIログ保存状態。未設定時はOFF。"""
+    db_path = os.path.join(os.path.dirname(__file__), "lap_timer.db")
+    connection = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = 'rssi_logging_enabled'"
+        ).fetchone()
+        return row is not None and str(row[0]) == "1"
+    finally:
+        connection.close()
+
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     setup_mode = get_setup_mode()
@@ -473,6 +505,18 @@ def root():
     }}
     </style></head><body><div class="wrap"><h1>Lite ラップタイマー</h1><div class="card">{state_html}</div></div></body></html>
     """
+
+
+@app.post("/admin/rssi-log/start")
+def admin_rssi_log_start():
+    set_rssi_logging_enabled(True)
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/rssi-log/stop")
+def admin_rssi_log_stop():
+    set_rssi_logging_enabled(False)
+    return RedirectResponse(url="/admin", status_code=303)
 
 
 @app.get("/admin/shutdown", response_class=HTMLResponse)
@@ -3637,7 +3681,18 @@ def admin():
 
         {""
         if not is_lite else
-        '''
+        f'''
+        <div style="margin-top:24px;padding:16px;border:2px solid #ddd;border-radius:12px;">
+            <div style="font-size:18px;font-weight:700;margin-bottom:8px;">検証用RSSIログ</div>
+            <div style="margin-bottom:8px;">状態: <strong>{'記録中' if is_rssi_logging_enabled() else '停止中'}</strong></div>
+            <form action="/admin/rssi-log/start" method="post">
+                <button type="submit" style="background:#1677ff;color:white;">▶ 検証ログ開始</button>
+            </form>
+            <form action="/admin/rssi-log/stop" method="post">
+                <button type="submit" style="background:#333;color:white;">■ 検証ログSTOP</button>
+            </form>
+        </div>
+
         <form action="/admin/lite-reset" method="post">
             <button type="submit">練習リセット</button>
         </form>

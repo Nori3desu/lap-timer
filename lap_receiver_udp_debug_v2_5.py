@@ -597,6 +597,23 @@ def save_web_rssi_log(
             connection.close()
 
 
+def is_web_rssi_logging_enabled() -> bool:
+    """検証用RSSIログがONのときだけTrueを返す。"""
+    connection = None
+    try:
+        connection = sqlite3.connect(WEB_DATABASE_PATH, timeout=2.0)
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = 'rssi_logging_enabled'"
+        ).fetchone()
+        return row is not None and str(row[0]) == "1"
+    except sqlite3.Error as error:
+        print(f"[RSSIログ状態確認エラー] {error}")
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 # ============================================================
 # Liteラップ記録ON/OFF
 # ============================================================
@@ -902,14 +919,16 @@ def update_receiver_state(
         now_monotonic - last_log_monotonic
         >= log_interval
     ):
-        save_web_rssi_log(
-            transmitter=transmitter,
-            packet=packet,
-        )
-
+        # OFF中も周期時刻は更新し、受信パケットごとのDB確認を避ける。
         state.last_rssi_log_monotonic[
             packet.receiver_id
         ] = now_monotonic
+
+        if is_web_rssi_logging_enabled():
+            save_web_rssi_log(
+                transmitter=transmitter,
+                packet=packet,
+            )
 
 
 def evaluate_gate(
