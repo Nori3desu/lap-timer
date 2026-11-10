@@ -181,14 +181,14 @@ class RegisteredTransmitter:
 
 REGISTERED_TRANSMITTERS = [
     RegisteredTransmitter(
-        serial_number="TX-0003",
-        udp_transmitter_id="TX-4DFE95",
-        mac_address="6B:EB:E2:4D:FE:95",
+        serial_number="TX-0001",
+        udp_transmitter_id="TX-5FBD50",
+        mac_address="30:DF:9E:5F:BD:50",
         uuid="12345678-1234-1234-1234-123456789abc",
         major=1,
         minor=1,
-        rider_name="河村",
-        bike_name="YZ250FX",
+        rider_name="TX01",
+        bike_name="TX001",
     ),
     RegisteredTransmitter(
         serial_number="TX-0002",
@@ -197,8 +197,18 @@ REGISTERED_TRANSMITTERS = [
         uuid="12345678-1234-1234-1234-123456789abc",
         major=1,
         minor=2,
-        rider_name="テスト",
-        bike_name="テスト車両",
+        rider_name="TX02",
+        bike_name="TX002",
+    ),
+    RegisteredTransmitter(
+        serial_number="TX-0003",
+        udp_transmitter_id="TX-4DFE95",
+        mac_address="6B:EB:E2:4D:FE:95",
+        uuid="12345678-1234-1234-1234-123456789abc",
+        major=1,
+        minor=3,
+        rider_name="TX03",
+        bike_name="TX003",
     ),
 ]
 
